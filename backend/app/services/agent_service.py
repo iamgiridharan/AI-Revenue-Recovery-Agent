@@ -5,12 +5,13 @@ This service orchestrates the AI agent workflow:
 1. Gather context about the case
 2. Call LLM for diagnosis and recommendation
 3. Validate structured output
-4. Record audit events
-5. Return validated recommendation
+4. Check policy engine
+5. Record audit events
+6. Return validated recommendation or escalation
 
 The agent NEVER directly executes payment operations.
 It produces structured recommendations that go through
-the Policy Engine (next phase).
+the Policy Engine.
 """
 import json
 import time
@@ -30,6 +31,7 @@ from app.services.agent_tools import (
     record_audit_event,
     escalate_case,
 )
+from app.services.policy_engine import evaluate_action
 from app.utils.logging import logger
 
 
@@ -266,7 +268,17 @@ def diagnose_case(db: Session, case_id: str) -> dict:
             "processing_time_ms": processing_time,
         }
     
-    # Step 4: Record audit event
+    # Step 4: Check policy engine
+    logger.info(f"Checking policy for case {case_id}")
+    policy_result = evaluate_action(
+        db=db,
+        case_id=case_id,
+        proposed_action=recommendation.recommended_action.value,
+        confidence=recommendation.confidence,
+        recovery_probability=recommendation.recovery_probability,
+    )
+    
+    # Step 5: Record audit event
     record_audit_event(
         db=db,
         case_id=case_id,
@@ -280,10 +292,12 @@ def diagnose_case(db: Session, case_id: str) -> dict:
             "diagnosis": recommendation.diagnosis,
             "recovery_probability": recommendation.recovery_probability,
             "customer_message": recommendation.customer_message,
+            "policy_decision": policy_result.decision,
+            "policy_reason": policy_result.reason,
         },
     )
     
-    # Step 5: Update case with diagnosis
+    # Step 6: Update case with diagnosis
     case = db.query(RevenueRiskCase).filter(RevenueRiskCase.case_id == case_id).first()
     if case:
         case.diagnosis = recommendation.diagnosis
@@ -295,7 +309,8 @@ def diagnose_case(db: Session, case_id: str) -> dict:
     
     logger.info(
         f"Case {case_id} diagnosed: {recommendation.recommended_action.value} "
-        f"(confidence: {recommendation.confidence:.2f})"
+        f"(confidence: {recommendation.confidence:.2f}) "
+        f"Policy: {policy_result.decision}"
     )
     
     return {
@@ -304,4 +319,5 @@ def diagnose_case(db: Session, case_id: str) -> dict:
         "case_id": case_id,
         "model_used": "mock-llm-v1",
         "processing_time_ms": processing_time,
+        "policy_decision": policy_result.model_dump(),
     }

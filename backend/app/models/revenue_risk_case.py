@@ -30,6 +30,7 @@ class RevenueRiskCase(Base):
     customer = relationship("Customer", back_populates="risk_cases")
     recovery_actions = relationship("RecoveryAction", back_populates="risk_case", lazy="dynamic", cascade="all, delete-orphan")
     audit_events = relationship("AuditEvent", back_populates="risk_case", lazy="dynamic", cascade="all, delete-orphan")
+    policy_decisions = relationship("PolicyDecision", back_populates="risk_case", lazy="dynamic", cascade="all, delete-orphan")
 
     # Composite indexes for common queries
     __table_args__ = (
