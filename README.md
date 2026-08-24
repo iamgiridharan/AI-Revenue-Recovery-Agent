@@ -123,6 +123,20 @@ LLM_API_KEY=
 3. Start the frontend: `cd frontend && npm run dev`
 4. Visit `http://localhost:5173`
 
+## Database Migrations
+
+```bash
+# Generate migration after model changes
+cd backend
+alembic revision --autogenerate -m "description"
+
+# Apply migrations
+alembic upgrade head
+
+# Rollback last migration
+alembic downgrade -1
+```
+
 ## Testing
 
 ```bash
@@ -135,18 +149,31 @@ cd frontend
 npm run build
 ```
 
-## API Endpoints (Phase 1)
+## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/health` | Health check with DB status |
+| GET | `/api/cases` | List revenue risk cases (paginated, filterable) |
+| GET | `/api/cases/{case_id}` | Get detailed case information |
+
+## Database Models
+
+| Model | Description |
+|-------|-------------|
+| Customer | Customer information and transaction stats |
+| Transaction | Payment transaction records |
+| RevenueRiskCase | Failed payments and recovery tracking |
+| RecoveryAction | Actions taken on risk cases |
+| AuditEvent | Audit trail for all case activities |
 
 ## Development Phases
 
-- **Phase 1** (Current): Project foundation & core architecture
-- **Phase 2**: ML risk assessment & payment failure detection
-- **Phase 3**: AI agent, policy engine & Razorpay integration
-- **Phase 4**: Analytics dashboard & reporting
+- **Phase 1**: Project foundation & core architecture
+- **Phase 2** (Current): Database models, migrations & case APIs
+- **Phase 3**: ML risk assessment & payment failure detection
+- **Phase 4**: AI agent, policy engine & Razorpay integration
+- **Phase 5**: Analytics dashboard & reporting
 
 ## License
 
