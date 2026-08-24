@@ -1,0 +1,30 @@
+{
+  "model_version": "v1",
+  "model_type": "RandomForestClassifier",
+  "training_timestamp": "2026-08-24T23:42:41.173349",
+  "feature_names": [
+    "amount",
+    "currency_encoded",
+    "payment_method_encoded",
+    "failure_reason_encoded",
+    "attempt_number",
+    "is_retry",
+    "hour_of_day",
+    "day_of_week",
+    "days_since_last_transaction",
+    "customer_total_transactions",
+    "customer_successful_transactions",
+    "customer_failed_transactions",
+    "customer_success_rate",
+    "customer_failure_rate",
+    "customer_lifetime_value",
+    "customer_avg_transaction_amount",
+    "customer_days_active",
+    "customer_recent_failure_count",
+    "customer_recent_success_count",
+    "amount_vs_avg_ratio"
+  ],
+  "num_features": 20,
+  "evaluation_metrics": {},
+  "revenue_metrics": {}
+}

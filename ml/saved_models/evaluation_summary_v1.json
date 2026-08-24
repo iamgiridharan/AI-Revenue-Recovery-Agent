@@ -1,0 +1,47 @@
+{
+  "model_version": "v1",
+  "dataset_records": 6000,
+  "dataset_customers": 1463,
+  "recovery_rate": 0.17033333333333334,
+  "standard_metrics": {
+    "precision": 0.3275862068965517,
+    "recall": 0.18627450980392157,
+    "f1_score": 0.2375,
+    "roc_auc": 0.6683744783053783,
+    "confusion_matrix": [
+      [
+        918,
+        78
+      ],
+      [
+        166,
+        38
+      ]
+    ]
+  },
+  "revenue_metrics": {
+    "total_failed_payment_value": 1353283.15,
+    "total_recoverable_payment_value": 175699.72000000003,
+    "predicted_recoverable_payment_value": 172984.98999999996,
+    "correctly_identified_recoverable_revenue": 48198.72000000001,
+    "missed_recoverable_revenue": 127501.0,
+    "false_positive_value": 124786.27,
+    "revenue_weighted_recall": 0.2743243984680226,
+    "revenue_weighted_precision": 0.2786294926513567,
+    "recovery_rate": 0.1298321936543731,
+    "potential_recovery_rate": 0.1278261611400393,
+    "actual_recovery_rate": 0.035616138426019725
+  },
+  "feature_importance_top10": {
+    "failure_reason_encoded": 0.1549386650070594,
+    "days_since_last_transaction": 0.08350879060677853,
+    "customer_days_active": 0.07710746509734909,
+    "amount": 0.07216093054515656,
+    "amount_vs_avg_ratio": 0.07178272938630821,
+    "customer_success_rate": 0.06775500479517008,
+    "customer_failure_rate": 0.06729917284608897,
+    "customer_avg_transaction_amount": 0.06575639564527347,
+    "customer_lifetime_value": 0.06315244274722538,
+    "hour_of_day": 0.053175045949868514
+  }
+}
