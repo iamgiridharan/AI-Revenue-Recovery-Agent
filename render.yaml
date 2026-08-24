@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: revenue-recovery-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: DEBUG
+        value: "false"
+      - key: CORS_ORIGINS
+        value: '["https://your-app.vercel.app","http://localhost:5173"]'
+    healthCheckPath: /api/health
