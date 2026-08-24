@@ -78,7 +78,6 @@ class PolicyConfigUpdate(BaseModel):
     
     @field_validator("minimum_ai_confidence")
     @classmethod
-    @classmethod
     def validate_confidence(cls, v):
         """Prevent obviously unsafe configurations."""
         if v is not None and v < 0.1:

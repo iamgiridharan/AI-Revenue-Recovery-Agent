@@ -6,6 +6,7 @@ from app.api.cases import router as cases_router
 from app.api.ml import router as ml_router
 from app.api.agent import router as agent_router
 from app.api.policy import router as policy_router
+from app.api.webhooks import router as webhooks_router
 from app.utils.errors import (
     AppError,
     app_error_handler,
@@ -41,6 +42,7 @@ app.include_router(cases_router, prefix="/api")
 app.include_router(ml_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(policy_router, prefix="/api")
+app.include_router(webhooks_router, prefix="/api")
 
 
 @app.on_event("startup")
