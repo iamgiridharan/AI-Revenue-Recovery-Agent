@@ -9,6 +9,23 @@ SessionLocal = None
 Base = declarative_base()
 
 
+def _build_database_url(url: str) -> str:
+    """Ensure the DATABASE_URL uses the correct SQLAlchemy driver.
+
+    Accepts plain postgres:// or postgresql:// URIs and converts them
+    to the modern postgresql+psycopg2:// form when needed.
+    """
+    # Normalize Heroku/Render-style postgres:// to postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+
+    # Ensure the postgresql+psycopg2 driver is specified
+    if url.startswith("postgresql://") and "+" not in url.split(":")[0]:
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    return url
+
+
 def init_database():
     """Initialize database engine and session factory."""
     global engine, SessionLocal
@@ -17,11 +34,13 @@ def init_database():
         raise ValueError(
             "DATABASE_URL is not configured. "
             "Please set it in your .env file. "
-            "Example: DATABASE_URL=postgresql://user:password@localhost:5432/revenue_recovery"
+            "Example: DATABASE_URL=postgresql+psycopg2://user:password@localhost:5432/revenue_recovery"
         )
 
+    database_url = _build_database_url(settings.DATABASE_URL)
+
     engine = create_engine(
-        settings.DATABASE_URL,
+        database_url,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,

@@ -11,21 +11,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app.core.config import get_settings
 from app.core.database import Base
 
-# Import all models so Alembic can detect them for autogenerate
-from app.models.customer import Customer
-from app.models.transaction import Transaction
-from app.models.revenue_risk_case import RevenueRiskCase
-from app.models.recovery_action import RecoveryAction
-from app.models.audit_event import AuditEvent
+# Import ALL models so Alembic can detect them for autogenerate
+from app.models.customer import Customer          # noqa: F401
+from app.models.transaction import Transaction      # noqa: F401
+from app.models.revenue_risk_case import RevenueRiskCase  # noqa: F401
+from app.models.recovery_action import RecoveryAction      # noqa: F401
+from app.models.audit_event import AuditEvent              # noqa: F401
+from app.models.policy_config import PolicyConfig          # noqa: F401
+from app.models.policy_decision import PolicyDecision      # noqa: F401
 
 settings = get_settings()
 
 # this is the Alembic Config object
 config = context.config
 
-# Set the database URL from our settings
-if settings.DATABASE_URL:
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Set the database URL from our settings (normalize driver if needed)
+database_url = settings.DATABASE_URL
+if database_url:
+    # Normalize Heroku/Render-style postgres:// to postgresql://
+    if database_url.startswith("postgres://"):
+        database_url = "postgresql://" + database_url[len("postgres://") :]
+    # Ensure the postgresql+psycopg2 driver is specified
+    if database_url.startswith("postgresql://") and "+" not in database_url.split(":")[0]:
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    config.set_main_option("sqlalchemy.url", database_url)
 
 # Set up Python logging from the config file
 if config.config_file_name is not None:

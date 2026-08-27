@@ -1,17 +1,25 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from app.core.database import Base, get_db
 from app.main import app
 
-# Use SQLite for testing (in-memory)
-TEST_DATABASE_URL = "sqlite:///./test.db"
+# Use in-memory SQLite for testing — no leftover .db files.
+TEST_DATABASE_URL = "sqlite://"  # in-memory
 
 engine = create_engine(
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
 )
+
+# Enable foreign key enforcement for SQLite (off by default)
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -36,7 +44,6 @@ def db_session():
     session.close()
     transaction.rollback()
     connection.close()
-
 
 @pytest.fixture(scope="function")
 def client(db_session):

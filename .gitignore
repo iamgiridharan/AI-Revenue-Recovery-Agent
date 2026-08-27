@@ -35,5 +35,11 @@ Thumbs.db
 htmlcov/
 .pytest_cache/
 
+# Database files (generated artifacts — NOT source code)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
 # Logs
 *.log
