@@ -34,7 +34,7 @@ if database_url:
     # Ensure the postgresql+psycopg2 driver is specified
     if database_url.startswith("postgresql://") and "+" not in database_url.split(":")[0]:
         database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    config.set_main_option("sqlalchemy.url", database_url)
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 # Set up Python logging from the config file
 if config.config_file_name is not None:

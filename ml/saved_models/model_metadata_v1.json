@@ -1,7 +1,7 @@
 {
   "model_version": "v1",
   "model_type": "RandomForestClassifier",
-  "training_timestamp": "2026-08-27T17:30:05.576276",
+  "training_timestamp": "2026-08-29T15:18:25.906110",
   "feature_names": [
     "amount",
     "currency_encoded",
