@@ -207,6 +207,11 @@ def run_simulation(
     # Generate synthetic transactions
     synthetic_txns = _generate_simulation_transactions(num_transactions, seed)
 
+    # Extract a short prefix from the simulation ID to make all generated
+    # entity IDs globally unique across simulation runs.  The original code
+    # used a simple counter (SIM-CUST-000000) which collided on a second run.
+    sim_id = simulation_id[4:]  # strip the "SIM-" prefix
+
     # Tracking variables
     total_recovered = 0.0
     total_at_risk = 0.0
@@ -233,7 +238,7 @@ def run_simulation(
             total_at_risk += amount
 
             # --- Step 1: Create customer ---
-            cust_id = f"SIM-CUST-{idx:06d}"
+            cust_id = f"SIM-CUST-{sim_id}-{idx:06d}"
             customer = Customer(
                 customer_id=cust_id,
                 name=f"Simulated Customer {idx}",
@@ -248,7 +253,7 @@ def run_simulation(
             db.flush()
 
             # --- Step 2: Create transaction ---
-            txn_id_str = f"SIM-TXN-{idx:06d}"
+            txn_id_str = f"SIM-TXN-{sim_id}-{idx:06d}"
             transaction = Transaction(
                 transaction_id=txn_id_str,
                 customer_id=customer.id,
@@ -270,7 +275,7 @@ def run_simulation(
             ml_probs.append(recovery_prob)
 
             # --- Step 4: Create risk case ---
-            case_id_str = f"SIM-CASE-{idx:06d}"
+            case_id_str = f"SIM-CASE-{sim_id}-{idx:06d}"
             case = RevenueRiskCase(
                 case_id=case_id_str,
                 transaction_id=transaction.id,
@@ -529,6 +534,12 @@ def run_simulation(
 
         except Exception as e:
             logger.error(f"Simulation error at transaction {idx}: {e}")
+            # Roll back the session so subsequent iterations are not
+            # stuck in a PendingRollbackError state.
+            try:
+                db.rollback()
+            except Exception:
+                logger.error(f"Failed to rollback session at transaction {idx}")
             # Continue processing other transactions
             continue
 

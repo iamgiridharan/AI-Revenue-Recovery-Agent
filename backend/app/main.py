@@ -1,3 +1,6 @@
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
@@ -19,10 +22,21 @@ from app.utils.logging import logger
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    # Startup
+    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+    yield
+    # Shutdown
+    logger.info(f"Shutting down {settings.APP_NAME}")
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description="AI-powered Revenue Recovery Agent API",
+    lifespan=lifespan,
 )
 
 # CORS
@@ -48,12 +62,3 @@ app.include_router(webhooks_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(simulation_router, prefix="/api")
 
-
-@app.on_event("startup")
-def startup_event():
-    logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    logger.info(f"Shutting down {settings.APP_NAME}")
