@@ -6,23 +6,6 @@ An AI-powered system that detects failed payments, predicts recovery probability
 **Payment Integration:** Razorpay Test Mode ONLY  
 **Latest Verification:** 303 automated tests passing, simulated recovery outcomes confirmed
 
-A fresh 100-transaction simulation was executed after correcting invalid
-policy configuration values.
-
-| Outcome | Count |
-|---------|------:|
-| RECOVERED | 9 |
-| OPEN | 13 |
-| ESCALATED | 78 |
-
-The verification confirmed:
-
-- Successful recovery cases are produced
-- Revenue recovered metrics are updated
-- Recovery rate is greater than 0
-- Recovered cases contain a complete audit trail
-- Policy validation prevents unsafe configurations
-
 ---
 
 ## Problem Statement
@@ -60,6 +43,14 @@ A simulation with **100 transactions** produced a realistic mix of outcomes:
 | **RECOVERED** | 9 | Successfully recovered via simulated payment |
 | **OPEN** | 13 | Recovery failed, eligible for retry |
 | **ESCALATED** | 78 | Escalated to human review (low confidence or policy limits) |
+
+The verification confirmed:
+
+- Successful recovery cases are produced
+- Revenue recovered metrics are updated
+- Recovery rate is greater than 0
+- Recovered cases contain a complete audit trail
+- Policy validation prevents unsafe configurations
 
 **Dashboard Metrics:**
 - Simulated Revenue Recovered: **₹7,664.39**
