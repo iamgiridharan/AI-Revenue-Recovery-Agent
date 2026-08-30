@@ -44,6 +44,10 @@ def get_active_policy(db: Session) -> Optional[PolicyConfig]:
     
     Returns the most recently updated active policy,
     or creates a default one if none exists.
+    
+    If the existing policy has values that would make recovery
+    impossible (e.g. autonomous_amount_limit=0), they are reset
+    to safe defaults.
     """
     policy = db.query(PolicyConfig).filter(PolicyConfig.is_active == True).first()
     
@@ -65,6 +69,52 @@ def get_active_policy(db: Session) -> Optional[PolicyConfig]:
         db.commit()
         db.refresh(policy)
         logger.info("Created default policy configuration")
+    else:
+        # Validate that the active policy has sane values.
+        # If critical thresholds are set to impossible values (e.g. by
+        # a manual API call), reset them to safe defaults so that
+        # recovery actions can actually be approved.
+        needs_reset = False
+        if policy.autonomous_amount_limit < 100:
+            logger.warning(
+                f"Policy autonomous_amount_limit={policy.autonomous_amount_limit} "
+                f"is too low — resetting to {DEFAULT_POLICY_CONFIG['autonomous_amount_limit']}"
+            )
+            policy.autonomous_amount_limit = DEFAULT_POLICY_CONFIG["autonomous_amount_limit"]
+            needs_reset = True
+        if policy.minimum_ai_confidence > 0.95:
+            logger.warning(
+                f"Policy minimum_ai_confidence={policy.minimum_ai_confidence} "
+                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['minimum_ai_confidence']}"
+            )
+            policy.minimum_ai_confidence = DEFAULT_POLICY_CONFIG["minimum_ai_confidence"]
+            needs_reset = True
+        if policy.minimum_recovery_probability > 0.95:
+            logger.warning(
+                f"Policy minimum_recovery_probability={policy.minimum_recovery_probability} "
+                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['minimum_recovery_probability']}"
+            )
+            policy.minimum_recovery_probability = DEFAULT_POLICY_CONFIG["minimum_recovery_probability"]
+            needs_reset = True
+        if policy.escalation_threshold > 0.95:
+            logger.warning(
+                f"Policy escalation_threshold={policy.escalation_threshold} "
+                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['escalation_threshold']}"
+            )
+            policy.escalation_threshold = DEFAULT_POLICY_CONFIG["escalation_threshold"]
+            needs_reset = True
+        if policy.case_lifetime_days < 1:
+            logger.warning(
+                f"Policy case_lifetime_days={policy.case_lifetime_days} "
+                f"is too low — resetting to {DEFAULT_POLICY_CONFIG['case_lifetime_days']}"
+            )
+            policy.case_lifetime_days = DEFAULT_POLICY_CONFIG["case_lifetime_days"]
+            needs_reset = True
+        if needs_reset:
+            policy.description = "Policy reset to safe defaults (previous values were non-functional)"
+            db.commit()
+            db.refresh(policy)
+            logger.info("Policy configuration corrected to safe defaults")
     
     return policy
 

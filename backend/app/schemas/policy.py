@@ -74,6 +74,8 @@ class PolicyConfigUpdate(BaseModel):
         """Prevent obviously unsafe configurations."""
         if v is not None and v > 100000:
             raise ValueError("Autonomous amount limit cannot exceed 100,000 INR")
+        if v is not None and v < 100:
+            raise ValueError("Autonomous amount limit must be at least 100 INR to allow recovery actions")
         return v
     
     @field_validator("minimum_ai_confidence")
@@ -82,6 +84,8 @@ class PolicyConfigUpdate(BaseModel):
         """Prevent obviously unsafe configurations."""
         if v is not None and v < 0.1:
             raise ValueError("Minimum AI confidence cannot be below 0.1")
+        if v is not None and v > 0.95:
+            raise ValueError("Minimum AI confidence cannot exceed 0.95 (no model achieves perfect confidence)")
         return v
     
     @field_validator("minimum_recovery_probability")
@@ -90,6 +94,16 @@ class PolicyConfigUpdate(BaseModel):
         """Prevent obviously unsafe configurations."""
         if v is not None and v < 0.05:
             raise ValueError("Minimum recovery probability cannot be below 0.05")
+        if v is not None and v > 0.95:
+            raise ValueError("Minimum recovery probability cannot exceed 0.95 (no model predicts perfect recovery)")
+        return v
+    
+    @field_validator("escalation_threshold")
+    @classmethod
+    def validate_escalation_threshold(cls, v):
+        """Prevent escalation threshold from being impossibly high."""
+        if v is not None and v > 0.95:
+            raise ValueError("Escalation threshold cannot exceed 0.95")
         return v
 
 

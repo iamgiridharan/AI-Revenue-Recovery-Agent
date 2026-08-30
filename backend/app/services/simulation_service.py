@@ -319,7 +319,7 @@ def run_simulation(
             recommended_action = _determine_action(
                 recovery_prob, risk_score, txn_data["failure_reason"]
             )
-            confidence = min(max(recovery_prob * 0.9 + random.uniform(-0.05, 0.05), 0.1), 0.99)
+            confidence = min(max(recovery_prob + random.uniform(-0.1, 0.1), 0.1), 0.99)
 
             diagnosis = _generate_diagnosis(
                 txn_data["failure_reason"], recovery_prob, risk_score
