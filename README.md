@@ -307,13 +307,83 @@ The system includes sanity validation to prevent configurations that would make 
 - `minimum_recovery_probability` must be ≤ 0.95
 - `escalation_threshold` must be ≤ 0.95
 
-Invalid configurations are auto-corrected at runtime and rejected by the API.
+Invalid configurations are **rejected by the API** (`PUT /api/policies` returns a validation
+error). Runtime reads never rewrite a stored policy: values outside these ranges are logged
+as a warning and left exactly as configured, so operator settings (including a deliberately
+low autonomous amount limit) are preserved.
 
 ### Decisions
 
 - **APPROVED:** All checks passed, action allowed
 - **BLOCKED:** Critical check failed, action prevented
-- **ESCALATED:** Threshold exceeded, human review required
+- **ESCALATED:** Threshold exceeded, human review required. The case is moved to the
+  `ESCALATED` status and a `CASE_ESCALATED` audit event is recorded, so escalations are
+  visible to the dashboard and to operators.
+
+---
+
+## Value-Aware Recovery Scoring (Estimates)
+
+Recovery candidates can be scored by estimated value so that a human (or the agent)
+can see what a recovery attempt is worth. The calculation is deterministic:
+
+```
+expected gross recovery = payment amount × probability of verified recovery
+expected net recovery   = expected gross recovery − intervention cost
+utility score          = expected net recovery − configured penalties
+```
+
+Every figure is returned separately (`expected_gross_recovery`, `intervention_cost`,
+`expected_net_recovery`, `utility_score`, `penalties`) with its provenance, and is
+labelled `ESTIMATE`. Estimates are never written to `recovered_amount`, which is only
+set by a verified payment webhook.
+
+### What the probability is (and is not)
+
+`recovery_probability` is a **case-level** model output: the RandomForest predicts
+whether a failed payment ends up recovered (target `recovered`) from features known at
+failure time. It is **not** an action-specific probability — the model has no notion of
+"recovery probability *given* a payment link vs. a reminder". The same probability is
+therefore applied to every candidate action, so the estimate improves the *level* of the
+value and cross-case comparison, but it cannot discriminate between actions for one case.
+Ranking differences within a case come from intervention cost and eligibility only.
+No per-action probability is invented; callers may inject action-specific probabilities
+explicitly, in which case the response marks them `caller_supplied` and flags the estimate
+as action-specific.
+
+Measured quality of the case-level probability (from
+`ml/saved_models/evaluation_summary_v1.json`, held-out synthetic split) is reported with
+every assessment: **ROC-AUC 0.668, precision 0.328, recall 0.186, base rate 0.170**.
+
+### Intervention costs
+
+No intervention costs are measured anywhere in this system. A cost is used only when a
+deployment configures one (`INTERVENTION_COSTS`) — it is never assumed. When no cost is
+available, `expected_net_recovery` is reported as **not computed** rather than silently
+treated as zero. Penalties are never folded into the net-recovery formula: they are
+itemized separately and applied only to the utility score, which is explicitly not a
+monetary figure.
+
+### Eligibility and safety
+
+Value scoring **ranks eligible candidate actions and never authorizes or executes anything**:
+
+- The Policy Engine remains the sole authorization authority; the only policy use here is a
+  non-persisting pre-check (`persist=False`) that writes no decision or audit row.
+- Candidates blocked or escalated by policy, terminal cases (`RECOVERED`, `CLOSED`), already
+  recovered payments, and non-executable actions are excluded from the ranking and listed
+  with the reason instead.
+- The response always states `authorization: {required: true, authority: "policy_engine"}`.
+- Retry limits, approval thresholds, monetary limits, webhook behaviour and provider
+  integrations are unchanged by this feature.
+
+### Where to see it
+
+- `GET /api/cases/{case_id}/value` — the full assessment (formula, inputs, provenance,
+  gross/cost/net/utility, ranked and excluded candidates, assumptions, limitations).
+- `GET /api/cases/{case_id}/detail` — the same assessment under `value_assessment`.
+- Case detail page — an “Estimated Recovery Value” panel showing the formula, inputs and
+  assumptions, with estimates visually separated from actual recovered revenue.
 
 ---
 
@@ -321,7 +391,7 @@ Invalid configurations are auto-corrected at runtime and rejected by the API.
 
 - **Mode:** Test Mode ONLY (never Live Mode)
 - **Payment Links:** Created via Razorpay API
-- **Webhook Handling:** Verifies signature, prevents duplicates
+- **Webhook Handling:** Verifies signature (fails closed when no secret is configured), prevents duplicates
 - **Mock Mode:** Falls back to mock behavior when credentials are not configured
 
 > **Note:** Without Razorpay Test Mode credentials configured, the system operates in mock/simulated mode. No real payment links are created. The simulation pipeline demonstrates recovery outcomes without requiring Razorpay credentials.
@@ -400,6 +470,7 @@ Each simulation produces a realistic distribution of outcomes based on ML predic
 | GET | `/api/cases` | List cases (paginated, filterable) |
 | GET | `/api/cases/{case_id}` | Get case detail |
 | GET | `/api/cases/{case_id}/detail` | Full case with related entities |
+| GET | `/api/cases/{case_id}/value` | Estimated recovery value (estimates only; never authorizes) |
 | POST | `/api/ml/predict` | ML recovery prediction |
 | POST | `/api/ml/predict/batch` | Batch ML predictions |
 | GET | `/api/ml/model` | Model information |
@@ -481,8 +552,10 @@ curl -X POST http://localhost:8000/api/simulation/run \
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `RAZORPAY_KEY_ID` | No | Razorpay Test Mode key |
 | `RAZORPAY_KEY_SECRET` | No | Razorpay Test Mode secret |
-| `RAZORPAY_WEBHOOK_SECRET` | No | Razorpay webhook secret |
+| `RAZORPAY_WEBHOOK_SECRET` | Yes (for webhooks) | Razorpay webhook secret. Webhook signature verification fails closed without it |
 | `LLM_API_KEY` | No | LLM API key (mock used if empty) |
+| `INTERVENTION_COSTS` | No | JSON map of action → intervention cost in INR for value scoring, e.g. `{"RETRY": 3.0}`. Empty means no cost is available, so expected net recovery is not computed |
+| `UTILITY_PENALTIES` | No | JSON map of action → contact/operational penalty in INR applied only to the utility score |
 | `DEBUG` | No | Enable debug mode |
 | `CORS_ORIGINS` | No | Allowed CORS origins |
 
@@ -610,7 +683,7 @@ python -m pytest tests/ -v
 - ✅ `.env.example` contains only placeholders
 - ✅ Razorpay Test Mode only (never Live Mode)
 - ✅ Razorpay secret keys only on backend
-- ✅ Webhook signature verification enabled
+- ✅ Webhook signature verification enabled (fails closed: unsigned webhooks are rejected with 401)
 - ✅ Duplicate webhook protection
 - ✅ Policy limits enforced on all actions
 - ✅ LLM cannot bypass Policy Engine
@@ -629,6 +702,11 @@ python -m pytest tests/ -v
 4. **Single-tenant** — No merchant authentication/authorization
 5. **No real-time updates** — Dashboard requires manual refresh
 6. **SQLite for tests** — Production uses PostgreSQL
+7. **No action-specific recovery probabilities** — the ML model predicts a case-level
+   probability of recovery, so value scoring cannot rank actions by likelihood; with one
+   shared probability and no costs configured, ranking is driven by cost and eligibility
+8. **No measured intervention costs** — net recovery is only computed when a deployment
+   configures `INTERVENTION_COSTS`; otherwise it is reported as not computed
 
 ## Future Improvements
 

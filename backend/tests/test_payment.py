@@ -153,14 +153,28 @@ class TestRazorpayService:
         assert result["reference_id"].startswith("recovery_")
 
     def test_verify_webhook_signature_no_secret(self):
-        """Test webhook signature verification skips when no secret is configured."""
+        """
+        Test webhook signature verification fails CLOSED when no secret is set.
+
+        A missing secret used to skip verification entirely, which let anyone
+        mark a case as recovered with an arbitrary amount.
+        """
+        import hashlib
+        import hmac
         from app.services.razorpay_service import verify_webhook_signature
 
         with patch("app.services.razorpay_service.settings") as mock_settings:
             mock_settings.RAZORPAY_WEBHOOK_SECRET = ""
-            result = verify_webhook_signature("payload", "sig")
+            assert verify_webhook_signature("payload", "sig") is False
+            assert verify_webhook_signature("payload", "") is False
 
-        assert result is True  # Skips verification when no secret
+            # With a secret configured the normal verification path is used.
+            mock_settings.RAZORPAY_WEBHOOK_SECRET = "test_webhook_secret"
+            signature = hmac.new(
+                b"test_webhook_secret", b"payload", hashlib.sha256
+            ).hexdigest()
+            assert verify_webhook_signature("payload", signature) is True
+            assert verify_webhook_signature("payload", "wrong") is False
 
     def test_verify_webhook_signature_valid(self):
         """Test valid webhook signature verification."""
@@ -353,17 +367,21 @@ class TestRecoveryService:
 
         assert result["success"] is False
         assert result["action_executed"] is False
-        assert "Policy blocked" in result["error"]
+        # Amounts above the autonomous limit require human review, i.e. ESCALATED
+        assert result["escalated"] is True
+        assert "Policy escalated" in result["error"]
 
-        # Verify blocked recovery action created
+        # Verify the escalated recovery action was created and the case is visible
         case = db_session.query(RevenueRiskCase).filter(
             RevenueRiskCase.case_id == "CASE-TEST-001"
         ).first()
+        assert case.status == CaseStatus.ESCALATED.value
         action = db_session.query(RecoveryAction).filter(
             RecoveryAction.case_id == case.id
         ).first()
         assert action is not None
-        assert action.execution_status == "BLOCKED_BY_POLICY"
+        assert action.policy_result == "ESCALATED"
+        assert action.execution_status == "ESCALATED"
 
     def test_execute_recovery_send_reminder(self, db_session, risk_case, active_policy):
         """Test SEND_PAYMENT_REMINDER action."""
@@ -736,21 +754,22 @@ class TestEndToEndRecovery:
             recovery_probability=0.05,  # Below 0.2 minimum
         )
 
-        # Verify action was blocked
+        # Verify the action was escalated (low confidence needs human review)
         assert result["success"] is False
         assert result["action_executed"] is False
-        assert "Policy blocked" in result["error"]
+        assert result["escalated"] is True
+        assert "Policy escalated" in result["error"]
 
         # Verify no payment link was created
         assert "payment_link_id" not in result
 
-        # Verify case status unchanged
+        # The case must be visibly escalated for human review, not silently blocked
         case = db_session.query(RevenueRiskCase).filter(
             RevenueRiskCase.case_id == "CASE-TEST-001"
         ).first()
-        assert case.status == "OPEN"
+        assert case.status == CaseStatus.ESCALATED.value
 
-        # Verify audit events: policy engine records ESCALATED, recovery service records BLOCKED_BY_POLICY
+        # Verify audit events: policy engine records ESCALATED, recovery service records the escalation
         policy_audit = db_session.query(AuditEvent).filter(
             AuditEvent.case_id == case.id,
             AuditEvent.event_type == AuditEventType.POLICY_CHECKED.value,
@@ -760,19 +779,18 @@ class TestEndToEndRecovery:
 
         recovery_audit = db_session.query(AuditEvent).filter(
             AuditEvent.case_id == case.id,
-            AuditEvent.event_type == AuditEventType.ACTION_FAILED.value,
+            AuditEvent.event_type == AuditEventType.CASE_ESCALATED.value,
         ).first()
         assert recovery_audit is not None
-        assert recovery_audit.result == "BLOCKED_BY_POLICY"
+        assert recovery_audit.actor == "recovery_service"
+        assert recovery_audit.result == "ESCALATED"
 
     def test_retry_limit_enforcement(self, db_session, risk_case, active_policy):
-        """Test that retry limit is enforced by policy."""
+        """Test that the retry limit (max_retries) is enforced by policy."""
         from app.services.recovery_service import execute_recovery_action
 
-        # Each RETRY internally creates a CREATE_PAYMENT_LINK RecoveryAction,
-        # so each RETRY counts as 1 recovery attempt.
-        # max_recovery_attempts=3, so we can do 3 RETRYs before hitting the limit.
-        for i in range(3):
+        # max_retries=2: two RETRY actions are allowed.
+        for i in range(2):
             result = execute_recovery_action(
                 db=db_session,
                 case_id="CASE-TEST-001",
@@ -783,19 +801,31 @@ class TestEndToEndRecovery:
             )
             assert result["success"] is True, f"Retry {i+1} should succeed"
 
-        # Fourth retry should be blocked by recovery attempt limit
+        # The third retry is blocked by MAX_RETRIES (not by the total attempt cap),
+        # which was previously impossible because retries were recorded as
+        # CREATE_PAYMENT_LINK and the retry counter therefore always saw zero.
         result = execute_recovery_action(
             db=db_session,
             case_id="CASE-TEST-001",
             action_type="RETRY",
             confidence=0.85,
             recovery_probability=0.75,
-            reason="Retry 4 - should be blocked",
+            reason="Retry 3 - should be blocked",
         )
 
         assert result["success"] is False
         assert result["action_executed"] is False
         assert "Policy blocked" in result["error"]
+        assert "Retry limit reached" in result["error"]
+
+        # RETRY actions must be recorded as RETRY for the policy rule to see them.
+        actions = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).all()
+        executed_labels = {
+            a.action_type for a in actions if a.execution_status == "SUCCESS"
+        }
+        assert executed_labels == {"RETRY"}
 
 
 # ============================================================================
@@ -857,17 +887,19 @@ class TestAuditTrail:
 
         # The action should be escalated (amount exceeds limit), not blocked
         assert result["success"] is False
+        assert result["escalated"] is True
 
         case = db_session.query(RevenueRiskCase).filter(
             RevenueRiskCase.case_id == "CASE-TEST-001"
         ).first()
+        assert case.status == CaseStatus.ESCALATED.value
 
-        # Check for both blocked recovery action and audit event
+        # Check for both the escalated recovery action and its audit event
         action = db_session.query(RecoveryAction).filter(
             RecoveryAction.case_id == case.id
         ).first()
-        assert action.policy_result == "BLOCKED"
-        assert action.execution_status == "BLOCKED_BY_POLICY"
+        assert action.policy_result == "ESCALATED"
+        assert action.execution_status == "ESCALATED"
 
         # Policy engine also creates its own audit event
         policy_audit = db_session.query(AuditEvent).filter(
@@ -878,10 +910,10 @@ class TestAuditTrail:
 
         recovery_audit = db_session.query(AuditEvent).filter(
             AuditEvent.case_id == case.id,
-            AuditEvent.event_type == AuditEventType.ACTION_FAILED.value,
+            AuditEvent.event_type == AuditEventType.CASE_ESCALATED.value,
         ).first()
         assert recovery_audit is not None
-        assert recovery_audit.result == "BLOCKED_BY_POLICY"
+        assert recovery_audit.result == "ESCALATED"
 
     def test_webhook_creates_audit_event(self, db_session, risk_case):
         """Test that webhook processing creates audit events."""
@@ -908,3 +940,310 @@ class TestAuditTrail:
         assert audit.metadata_ is not None
         assert audit.metadata_["payment_id"] == "pay_audit_test"
         assert audit.metadata_["amount"] == 2500.0
+
+
+# ============================================================================
+# Webhook signature, idempotency and state-transition guards
+# ============================================================================
+
+
+def _captured_payload(payment_id: str, amount_paise: int = 250000) -> dict:
+    """Build a minimal payment.captured webhook payload for the test case."""
+    return {
+        "event": "payment.captured",
+        "payload": {
+            "payment": {
+                "entity": {
+                    "id": payment_id,
+                    "amount": amount_paise,
+                    "currency": "INR",
+                    "status": "captured",
+                    "notes": {"reference_id": "CASE-TEST-001"},
+                }
+            }
+        },
+    }
+
+
+class TestWebhookSecurityAndIdempotency:
+    """Regression tests for webhook fail-closed behaviour, retry safety and state guards."""
+
+    def test_webhook_rejected_when_no_secret_configured(self, client, db_session, risk_case):
+        """
+        An unsigned webhook must be rejected (401) when no webhook secret is
+        configured - otherwise anyone could mark a case recovered.
+        """
+        import json
+
+        payload = _captured_payload("pay_unsigned_1")
+
+        with patch("app.services.razorpay_service.settings") as mock_settings:
+            mock_settings.RAZORPAY_WEBHOOK_SECRET = ""
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 401
+
+        case = db_session.query(RevenueRiskCase).filter(
+            RevenueRiskCase.case_id == "CASE-TEST-001"
+        ).first()
+        assert case.status == "OPEN"
+        assert case.recovered_amount == 0.0
+
+    def test_failed_delivery_remains_retryable(self, client, db_session, risk_case):
+        """
+        Regression test: an event must only be marked as processed AFTER it has
+        been handled.  Previously a 500 response still recorded the event, so the
+        provider's retry was discarded as a duplicate and the payment was lost.
+        """
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        payload = _captured_payload("pay_retry_1")
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True), \
+             patch(
+                 "app.api.webhooks.process_payment_success",
+                 side_effect=RuntimeError("transient database failure"),
+             ):
+            first = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                    "X-Razorpay-Event-Id": "evt_retry_1",
+                },
+            )
+        assert first.status_code == 500
+        assert "evt_retry_1" not in webhooks._processed_events
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            second = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                    "X-Razorpay-Event-Id": "evt_retry_1",
+                },
+            )
+
+        assert second.status_code == 200
+        assert "Duplicate" not in second.json()["message"]
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.RECOVERED.value
+        assert risk_case.recovered_amount == 2500.0
+
+    def test_provider_event_id_header_is_honoured(self, client, db_session, risk_case):
+        """Two distinct deliveries of the same payload are not collapsed."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        payload = _captured_payload("pay_event_id_1")
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            first = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                    "X-Razorpay-Event-Id": "evt_distinct_1",
+                },
+            )
+            second = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                    "X-Razorpay-Event-Id": "evt_distinct_2",
+                },
+            )
+
+        assert first.json()["message"] == "Payment success processed"
+        # The second delivery is a different provider event: it reaches the
+        # handler (and is then ignored by the already-recovered guard), rather
+        # than being dropped as a duplicate of the first.
+        assert second.json()["message"] == "Payment success processed"
+        assert second.json()["result"]["duplicate"] is True
+
+        # The same event id delivered twice is still deduplicated.
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            third = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                    "X-Razorpay-Event-Id": "evt_distinct_2",
+                },
+            )
+        assert "Duplicate" in third.json()["message"]
+
+    def test_payment_link_paid_maps_to_case(self, client, db_session, risk_case):
+        """
+        Regression test: payment_link.paid carries the case reference on the
+        payment_link entity, so it must mark the case recovered.
+        """
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        payload = {
+            "event": "payment_link.paid",
+            "payload": {
+                "payment_link": {
+                    "entity": {
+                        "id": "plink_paid_1",
+                        "reference_id": "CASE-TEST-001",
+                        "amount": 250000,
+                        "status": "paid",
+                        "notes": {},
+                    }
+                },
+                "payment": {
+                    "entity": {
+                        "id": "pay_link_paid_1",
+                        "amount": 250000,
+                        "status": "captured",
+                        "notes": {},
+                    }
+                },
+            },
+        }
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["status"] == "RECOVERED"
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.RECOVERED.value
+        assert risk_case.recovered_amount == 2500.0
+
+    def test_late_failure_does_not_reopen_recovered_case(self, client, db_session, risk_case):
+        """A failure event arriving after recovery must not reopen the case."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        risk_case.status = CaseStatus.RECOVERED.value
+        risk_case.recovered_amount = 2500.0
+        db_session.commit()
+
+        payload = {
+            "event": "payment.failed",
+            "payload": {
+                "payment": {
+                    "entity": {
+                        "id": "pay_late_fail_1",
+                        "amount": 250000,
+                        "status": "failed",
+                        "notes": {"reference_id": "CASE-TEST-001"},
+                    }
+                }
+            },
+        }
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(payload),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["ignored"] is True
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.RECOVERED.value
+        assert risk_case.recovered_amount == 2500.0
+
+    def test_success_on_closed_case_is_not_resurrected(self, client, db_session, risk_case):
+        """A closed case must not be silently marked recovered by a late capture."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        risk_case.status = CaseStatus.CLOSED.value
+        db_session.commit()
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_closed_1")),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert "manual reconciliation" in result["error"]
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.CLOSED.value
+        assert risk_case.recovered_amount == 0.0
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.decision == "PAYMENT_SUCCESS_REJECTED",
+        ).first()
+        assert audit is not None
+
+    def test_duplicate_success_does_not_overwrite_recovered_amount(
+        self, client, db_session, risk_case
+    ):
+        """A repeat capture with a different amount must not overwrite the record."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+        risk_case.status = CaseStatus.RECOVERED.value
+        risk_case.recovered_amount = 2500.0
+        db_session.commit()
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_mismatch_1", amount_paise=99999900)),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["recovered_amount"] == 2500.0
+
+        db_session.refresh(risk_case)
+        assert risk_case.recovered_amount == 2500.0
+        assert risk_case.status == CaseStatus.RECOVERED.value
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.decision == "PAYMENT_SUCCESS_AMOUNT_MISMATCH",
+        ).first()
+        assert audit is not None

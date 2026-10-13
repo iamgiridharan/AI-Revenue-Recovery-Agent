@@ -10,6 +10,7 @@ import pandas as pd
 import joblib
 import json
 from datetime import datetime
+from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     precision_score,
@@ -19,15 +20,27 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report,
 )
+from ml import config as ml_config
 from ml.config import (
     MODEL_VERSION,
     MODEL_TYPE,
-    MODELS_DIR,
     RANDOM_SEED,
     RANDOM_FOREST_PARAMS,
     FEATURE_COLUMNS,
     TARGET_COLUMN,
 )
+
+
+def _models_dir() -> Path:
+    """
+    Resolve the model artifacts directory at call time.
+
+    ``ml.config.MODELS_DIR`` is the single configuration knob for where
+    artifacts live.  Reading it lazily (instead of binding the value at import
+    time) keeps that knob authoritative, so tests can point it at a temporary
+    directory and training runs never write into the committed artifacts.
+    """
+    return Path(ml_config.MODELS_DIR)
 
 
 def train_model(
@@ -198,17 +211,18 @@ def save_model(
         Dictionary with paths to saved artifacts
     """
     timestamp = datetime.now().isoformat()
+    models_dir = _models_dir()
 
     # Save model
-    model_path = MODELS_DIR / f"recovery_model_{MODEL_VERSION}.joblib"
+    model_path = models_dir / f"recovery_model_{MODEL_VERSION}.joblib"
     joblib.dump(model, model_path)
 
     # Save encoders
-    encoders_path = MODELS_DIR / f"encoders_{MODEL_VERSION}.joblib"
+    encoders_path = models_dir / f"encoders_{MODEL_VERSION}.joblib"
     joblib.dump(encoders, encoders_path)
 
     # Save scaler
-    scaler_path = MODELS_DIR / f"scaler_{MODEL_VERSION}.joblib"
+    scaler_path = models_dir / f"scaler_{MODEL_VERSION}.joblib"
     joblib.dump(scaler, scaler_path)
 
     # Save metadata
@@ -222,7 +236,7 @@ def save_model(
         "revenue_metrics": revenue_metrics,
     }
 
-    metadata_path = MODELS_DIR / f"model_metadata_{MODEL_VERSION}.json"
+    metadata_path = models_dir / f"model_metadata_{MODEL_VERSION}.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
 
@@ -248,10 +262,12 @@ def load_model(version: str = None):
         from ml.config import MODEL_VERSION
         version = MODEL_VERSION
 
-    model_path = MODELS_DIR / f"recovery_model_{version}.joblib"
-    encoders_path = MODELS_DIR / f"encoders_{version}.joblib"
-    scaler_path = MODELS_DIR / f"scaler_{version}.joblib"
-    metadata_path = MODELS_DIR / f"model_metadata_{version}.json"
+    models_dir = _models_dir()
+
+    model_path = models_dir / f"recovery_model_{version}.joblib"
+    encoders_path = models_dir / f"encoders_{version}.joblib"
+    scaler_path = models_dir / f"scaler_{version}.joblib"
+    metadata_path = models_dir / f"model_metadata_{version}.json"
 
     # Check if files exist
     for path in [model_path, encoders_path, scaler_path]:

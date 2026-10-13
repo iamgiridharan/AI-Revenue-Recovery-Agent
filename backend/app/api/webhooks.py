@@ -27,7 +27,10 @@ from app.utils.logging import logger
 router = APIRouter(tags=["webhooks"])
 
 
-# In-memory store for duplicate detection (in production, use Redis or database)
+# In-memory store for duplicate detection.
+# NOTE: this is process-local and not persisted, so it does not protect against
+# replays after a restart or across multiple workers. A persistent event ledger
+# would require a new database table (schema change) and is out of scope here.
 _processed_events = set()
 MAX_EVENT_CACHE_SIZE = 10000
 
@@ -42,38 +45,58 @@ def _is_duplicate_event(event_id: str) -> bool:
     Returns:
         True if event is duplicate, False otherwise
     """
-    if event_id in _processed_events:
-        return True
-    
-    # Add to processed set
+    return event_id in _processed_events
+
+
+def _mark_event_processed(event_id: str) -> None:
+    """
+    Record an event as processed.
+
+    This must only be called AFTER the event has been handled successfully.
+    Marking a delivery before handling it turns a transient processing failure
+    into permanent data loss, because the provider's retry is then discarded as
+    a duplicate.
+
+    Args:
+        event_id: Unique event identifier
+    """
     _processed_events.add(event_id)
-    
+
     # Prevent memory leak by limiting cache size
     if len(_processed_events) > MAX_EVENT_CACHE_SIZE:
         # Remove oldest entries (simple approach - in production use Redis with TTL)
         _processed_events.clear()
         _processed_events.add(event_id)
-    
-    return False
 
 
-def _extract_event_id(payload: Dict[str, Any]) -> str:
+def _extract_event_id(payload: Dict[str, Any], header_event_id: str = "") -> str:
     """
     Extract unique event identifier from webhook payload.
     
     Args:
         payload: Webhook payload from Razorpay
+        header_event_id: Value of the provider's X-Razorpay-Event-Id header
         
     Returns:
         Unique event identifier
     """
-    # Use event + payment_id + created_at for uniqueness
+    # Prefer the provider's own event id: two distinct deliveries of the same
+    # event type for the same payment are indistinguishable in the payload.
+    if header_event_id:
+        return header_event_id
+
+    # Fall back to event + payment_id + created_at for uniqueness
     event_type = payload.get("event", "unknown")
     payload_data = payload.get("payload", {})
-    payment_entity = payload_data.get("payment", {}).get("entity", {})
+    payment_entity = payload_data.get("payment", {}).get("entity", {}) or {}
+    link_entity = payload_data.get("payment_link", {}).get("entity", {}) or {}
     
-    payment_id = payment_entity.get("id", "unknown")
-    created_at = payment_entity.get("created_at", "unknown")
+    payment_id = payment_entity.get("id") or link_entity.get("id") or "unknown"
+    created_at = (
+        payment_entity.get("created_at")
+        or link_entity.get("created_at")
+        or "unknown"
+    )
     
     return f"{event_type}:{payment_id}:{created_at}"
 
@@ -110,13 +133,14 @@ async def handle_razorpay_webhook(
         # Get signature from headers
         signature = request.headers.get("X-Razorpay-Signature", "")
         
-        # Verify webhook signature
+        # Verify webhook signature (fails closed when no secret is configured)
         if not verify_webhook_signature(payload_str, signature):
             logger.warning("Webhook signature verification failed")
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
         
-        # Extract event ID for duplicate detection
-        event_id = _extract_event_id(payload)
+        # Extract event ID for duplicate detection, preferring the provider's id
+        header_event_id = request.headers.get("X-Razorpay-Event-Id", "").strip()
+        event_id = _extract_event_id(payload, header_event_id)
         
         # Check for duplicate event
         if _is_duplicate_event(event_id):
@@ -132,18 +156,21 @@ async def handle_razorpay_webhook(
         event_type = event_data.get("event_type", "")
         
         logger.info(f"Processing webhook event: {event_type}")
+
+        # Case reference: payment entities carry it in notes.reference_id,
+        # payment_link entities carry it in reference_id.
+        notes = event_data.get("notes", {}) or {}
+        reference_id = (
+            event_data.get("reference_id")
+            or notes.get("reference_id")
+            or event_data.get("order_id")
+        )
         
         # Handle different event types
         if event_type in ["payment.authorized", "payment.captured", "payment_link.paid"]:
             # Payment successful
-            payment_id = event_data.get("payment_id")
+            payment_id = event_data.get("payment_id") or event_data.get("payment_link_id")
             amount = event_data.get("amount", 0)
-            
-            # Find the case by reference_id (case_id)
-            reference_id = event_data.get("notes", {}).get("reference_id")
-            if not reference_id:
-                # Try to find by order_id or other means
-                reference_id = event_data.get("order_id")
             
             if reference_id:
                 result = process_payment_success(
@@ -162,7 +189,7 @@ async def handle_razorpay_webhook(
                     result=result,
                 )
                 
-                return {
+                response = {
                     "success": True,
                     "message": "Payment success processed",
                     "event_id": event_id,
@@ -170,7 +197,7 @@ async def handle_razorpay_webhook(
                 }
             else:
                 logger.warning(f"No reference_id found in webhook event: {event_id}")
-                return {
+                response = {
                     "success": True,
                     "message": "Event processed but no case reference found",
                     "event_id": event_id,
@@ -178,11 +205,9 @@ async def handle_razorpay_webhook(
         
         elif event_type in ["payment.failed", "payment_link.expired"]:
             # Payment failed
-            payment_id = event_data.get("payment_id")
-            failure_reason = event_data.get("notes", {}).get("failure_reason", "Unknown")
+            payment_id = event_data.get("payment_id") or event_data.get("payment_link_id")
+            failure_reason = notes.get("failure_reason", "Unknown")
             
-            # Find the case
-            reference_id = event_data.get("notes", {}).get("reference_id")
             if reference_id:
                 result = process_payment_failure(
                     db=db,
@@ -200,7 +225,7 @@ async def handle_razorpay_webhook(
                     result=result,
                 )
                 
-                return {
+                response = {
                     "success": True,
                     "message": "Payment failure processed",
                     "event_id": event_id,
@@ -208,7 +233,7 @@ async def handle_razorpay_webhook(
                 }
             else:
                 logger.warning(f"No reference_id found in webhook event: {event_id}")
-                return {
+                response = {
                     "success": True,
                     "message": "Event processed but no case reference found",
                     "event_id": event_id,
@@ -217,11 +242,17 @@ async def handle_razorpay_webhook(
         else:
             # Unknown event type - log but don't fail
             logger.info(f"Unhandled webhook event type: {event_type}")
-            return {
+            response = {
                 "success": True,
                 "message": f"Event type {event_type} acknowledged",
                 "event_id": event_id,
             }
+
+        # Only now, after the event has been handled, is it safe to treat this
+        # delivery as processed (a failed delivery must remain retryable).
+        _mark_event_processed(event_id)
+
+        return response
         
     except HTTPException:
         raise

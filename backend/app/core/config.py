@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     # LLM
     LLM_API_KEY: str = ""
 
+    # Value-aware recovery scoring (estimates only, never authorization)
+    # Optional intervention cost per recovery action, in INR, e.g.
+    #   INTERVENTION_COSTS='{"RETRY": 3.0, "CREATE_PAYMENT_LINK": 2.0}'
+    # Empty means no measured/configured cost is available: expected net
+    # recovery is then reported as not computed rather than assumed to be zero.
+    INTERVENTION_COSTS: dict[str, float] = {}
+    # Optional contact / operational-risk penalties (INR) applied to the
+    # separately labelled utility score.  Empty means no penalties are applied.
+    UTILITY_PENALTIES: dict[str, float] = {}
+
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 

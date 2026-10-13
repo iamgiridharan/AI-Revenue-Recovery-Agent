@@ -280,6 +280,39 @@ class TestPolicyConfiguration:
         assert active.id == policy.id
         assert active.max_retries == 5
 
+    def test_get_active_policy_preserves_operator_values(self, db_session):
+        """
+        Regression test: reading the active policy must not rewrite it.
+
+        ``get_active_policy`` used to "correct" values it considered
+        non-functional and commit the change, so an operator's deliberate
+        settings (in particular a low autonomous amount limit) were silently
+        replaced - including on a plain GET /api/policies.
+        """
+        policy = PolicyConfig(
+            max_retries=2,
+            max_reminders=2,
+            max_recovery_attempts=3,
+            autonomous_amount_limit=50.0,   # below the API minimum
+            minimum_ai_confidence=0.98,     # above the API maximum
+            minimum_recovery_probability=0.2,
+            case_lifetime_days=7,
+            escalation_threshold=0.7,
+            is_active=True,
+            description="operator-defined strict policy",
+        )
+        db_session.add(policy)
+        db_session.commit()
+
+        active = get_active_policy(db_session)
+        assert active.id == policy.id
+
+        db_session.expire_all()
+        stored = db_session.query(PolicyConfig).filter(PolicyConfig.id == policy.id).first()
+        assert stored.autonomous_amount_limit == 50.0
+        assert stored.minimum_ai_confidence == 0.98
+        assert stored.description == "operator-defined strict policy"
+
 
 # ============================================================================
 # POLICY CHECK TESTS
@@ -325,6 +358,42 @@ class TestPolicyChecks:
         
         assert check.passed is True
         assert check.rule == "MAX_RECOVERY_ATTEMPTS"
+
+    def test_policy_blocked_actions_do_not_count_as_attempts(
+        self, db_session, sample_case, active_policy
+    ):
+        """
+        Regression test: a policy-blocked or escalated action was never
+        executed, so it must not consume the case's recovery budget.  Counting
+        them used to make blocked cases permanently unactionable.
+        """
+        for status, decision in (("BLOCKED_BY_POLICY", "BLOCKED"), ("ESCALATED", "ESCALATED")):
+            for action_type in (
+                RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+                RecoveryActionEnum.RETRY.value,
+                RecoveryActionEnum.SEND_PAYMENT_REMINDER.value,
+            ):
+                db_session.add(RecoveryAction(
+                    case_id=sample_case.id,
+                    action_type=action_type,
+                    reason=f"not executed ({status})",
+                    confidence=0.1,
+                    policy_result=decision,
+                    execution_status=status,
+                ))
+        db_session.commit()
+
+        attempts = check_recovery_attempts(db_session, sample_case, active_policy)
+        assert attempts.passed is True
+        assert attempts.value == 0.0
+
+        retries = check_retry_limit(db_session, sample_case, active_policy)
+        assert retries.passed is True
+        assert retries.value == 0.0
+
+        reminders = check_reminder_limit(db_session, sample_case, active_policy)
+        assert reminders.passed is True
+        assert reminders.value == 0.0
 
     def test_check_amount_limit_passed(self, db_session, sample_case, active_policy):
         """Test amount limit check when under limit."""

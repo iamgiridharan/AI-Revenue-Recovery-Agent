@@ -15,6 +15,22 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 
+def _artifact_hashes(directory) -> dict:
+    """Map artifact filename -> sha256 for every file in ``directory``.
+
+    Used to prove that running the training code in a test does not modify the
+    committed model artifacts in ``ml/saved_models``.
+    """
+    import hashlib
+
+    directory = Path(directory)
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(directory.glob("*"))
+        if path.is_file()
+    }
+
+
 class TestMLPreprocessing:
     """Tests for ML preprocessing pipeline."""
     
@@ -170,42 +186,60 @@ class TestMLModel:
         assert "revenue_weighted_recall" in rev_metrics
         assert "revenue_weighted_precision" in rev_metrics
         
-    def test_model_persistence(self):
-        """Test saving and loading model."""
+    def test_model_persistence(self, monkeypatch):
+        """Test saving and loading model in an isolated artifacts directory.
+
+        Regression test: this test used to write over the committed artifacts in
+        ``ml/saved_models`` because it patched ``ml.config.MODELS_DIR`` while
+        ``ml.model`` had already bound the value at import time.  It now redirects
+        the configured directory and asserts the committed artifacts are
+        byte-for-byte unchanged.
+        """
+        import ml.config
         from ml.model import train_model, save_model, load_model
         from ml.preprocessing import preprocess_training_data
         from ml.data_generator import load_dataset
-        from ml.config import FEATURE_COLUMNS, MODEL_VERSION
+        from ml.config import FEATURE_COLUMNS, MODELS_DIR
         import tempfile
-        import shutil
-        
+
+        committed_before = _artifact_hashes(MODELS_DIR)
+        committed_names = {
+            f"recovery_model_{ml.config.MODEL_VERSION}.joblib",
+            f"encoders_{ml.config.MODEL_VERSION}.joblib",
+            f"scaler_{ml.config.MODEL_VERSION}.joblib",
+            f"model_metadata_{ml.config.MODEL_VERSION}.json",
+        }
+        assert committed_names.issubset(committed_before), (
+            "expected the committed model artifacts to be present"
+        )
+
         df = load_dataset()
         X_train, X_test, y_train, y_test, encoders, scaler = preprocess_training_data(df)
-        
+
         model = train_model(X_train, y_train)
-        
+
         # Create temporary directory for test artifacts
         with tempfile.TemporaryDirectory() as tmpdir:
-            from ml.config import MODELS_DIR
-            original_dir = MODELS_DIR
-            
-            try:
-                # Override MODELS_DIR for testing
-                import ml.config
-                ml.config.MODELS_DIR = Path(tmpdir)
-                
-                # Save model
-                paths = save_model(model, encoders, scaler, {}, {}, FEATURE_COLUMNS)
-                assert "model_path" in paths
-                
-                # Load model
-                loaded_model, loaded_encoders, loaded_scaler, metadata = load_model()
-                assert loaded_model is not None
-                assert loaded_encoders is not None
-                assert loaded_scaler is not None
-                
-            finally:
-                ml.config.MODELS_DIR = original_dir
+            monkeypatch.setattr(ml.config, "MODELS_DIR", Path(tmpdir))
+
+            # Save model
+            paths = save_model(model, encoders, scaler, {}, {}, FEATURE_COLUMNS)
+            assert "model_path" in paths
+            for key in ("model_path", "encoders_path", "scaler_path", "metadata_path"):
+                assert Path(paths[key]).parent == Path(tmpdir), (
+                    f"{key} was written outside the isolated directory: {paths[key]}"
+                )
+
+            # Load model
+            loaded_model, loaded_encoders, loaded_scaler, metadata = load_model()
+            assert loaded_model is not None
+            assert loaded_encoders is not None
+            assert loaded_scaler is not None
+
+        # The committed artifacts must not have been touched by this test.
+        assert _artifact_hashes(MODELS_DIR) == committed_before, (
+            "model artifacts in ml/saved_models were modified by the test suite"
+        )
 
 
 class TestMLPredictor:

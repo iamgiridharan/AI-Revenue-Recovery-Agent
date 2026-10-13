@@ -17,6 +17,7 @@ from app.models import (
     AuditEvent,
     CaseStatus,
 )
+from app.services.value_service import assess_case_value
 from app.utils.logging import logger
 
 
@@ -285,7 +286,23 @@ def get_case_detail_with_relations(db: Session, case_id: str) -> Dict[str, Any]:
         for a in audit_events
     ]
 
+    # Estimated, advisory value assessment (Phase 2). Never an authorization and
+    # never a substitute for recovered_amount (actual revenue).  A malformed
+    # stored value (e.g. a probability outside [0, 1]) must not break the detail
+    # view: the failure is reported next to the assessment instead.
+    value_assessment = None
+    value_assessment_error = None
+    try:
+        value_assessment = assess_case_value(db, case)
+    except ValueError as exc:
+        value_assessment_error = str(exc)
+        logger.warning(
+            f"Value assessment unavailable for case {case.case_id}: {exc}"
+        )
+
     return {
+        "value_assessment": value_assessment,
+        "value_assessment_error": value_assessment_error,
         "case": {
             "id": case.id,
             "case_id": case.case_id,

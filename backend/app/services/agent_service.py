@@ -215,6 +215,22 @@ def diagnose_case(db: Session, case_id: str) -> dict:
             "case_id": case_id,
         }
     
+    # Step 1b: Stop after success (or closure).
+    # Diagnosing a settled case would burn an LLM call and overwrite the case
+    # status/recommendation of a case that must not be acted on again.
+    case_status = context["case"]["status"]
+    if case_status in (CaseStatus.RECOVERED.value, CaseStatus.CLOSED.value):
+        logger.info(f"Case {case_id} is {case_status}; skipping diagnosis (settled case)")
+        return {
+            "success": False,
+            "error": {
+                "message": f"Case {case_id} is {case_status}; no further recovery action"
+            },
+            "case_id": case_id,
+            "status": case_status,
+            "skipped": True,
+        }
+
     # Step 2: Build prompt and call LLM
     prompt = build_llm_prompt(context)
     raw_llm_output = call_llm(prompt)
@@ -300,9 +316,12 @@ def diagnose_case(db: Session, case_id: str) -> dict:
     # Step 6: Update case with diagnosis
     case = db.query(RevenueRiskCase).filter(RevenueRiskCase.case_id == case_id).first()
     if case:
+        # Do not drag a settled case back into the active workflow.
+        if case.status not in (CaseStatus.RECOVERED.value, CaseStatus.CLOSED.value,
+                               CaseStatus.ESCALATED.value):
+            case.status = CaseStatus.IN_PROGRESS.value
         case.diagnosis = recommendation.diagnosis
         case.recommended_action = recommendation.recommended_action.value
-        case.status = CaseStatus.IN_PROGRESS.value
         db.commit()
     
     processing_time = (time.time() - start_time) * 1000

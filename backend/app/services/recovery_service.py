@@ -99,30 +99,40 @@ def execute_recovery_action(
     
     # Step 5: Check if action is allowed
     if not policy_result.allowed:
+        # A BLOCKED decision is a hard stop; an ESCALATED decision still has to be
+        # reviewed by a human, so the case is moved to ESCALATED and recorded as
+        # such (otherwise escalated cases would be invisible to operators).
+        escalated = policy_result.decision == "ESCALATED"
+
         # Action blocked by policy - create recovery action record
         recovery_action = RecoveryAction(
             case_id=case.id,
             action_type=action_type,
             reason=reason,
             confidence=confidence,
-            policy_result="BLOCKED",
-            execution_status="BLOCKED_BY_POLICY",
+            policy_result=policy_result.decision,
+            execution_status="ESCALATED" if escalated else "BLOCKED_BY_POLICY",
         )
         db.add(recovery_action)
         
         # Create audit event
         audit_event = AuditEvent(
             case_id=case.id,
-            event_type=AuditEventType.ACTION_FAILED.value,
+            event_type=(AuditEventType.CASE_ESCALATED.value if escalated
+                        else AuditEventType.ACTION_FAILED.value),
             actor="recovery_service",
-            decision="BLOCKED",
-            reason=f"Policy blocked: {policy_result.reason}",
+            decision=policy_result.decision,
+            reason=(f"Policy escalated: {policy_result.reason}" if escalated
+                    else f"Policy blocked: {policy_result.reason}"),
             confidence=confidence,
             policy_checks=[c.model_dump() for c in policy_result.checks] if policy_result.checks else [],
             action=action_type,
-            result="BLOCKED_BY_POLICY",
+            result="ESCALATED" if escalated else "BLOCKED_BY_POLICY",
         )
         db.add(audit_event)
+
+        if escalated and case.status != CaseStatus.ESCALATED.value:
+            case.status = CaseStatus.ESCALATED.value
         
         db.commit()
         
@@ -130,8 +140,10 @@ def execute_recovery_action(
         
         return {
             "success": False,
-            "error": f"Policy blocked: {policy_result.reason}",
+            "error": (f"Policy escalated: {policy_result.reason}" if escalated
+                      else f"Policy blocked: {policy_result.reason}"),
             "action_executed": False,
+            "escalated": escalated,
             "policy_decision": policy_result.model_dump(),
         }
     
@@ -144,6 +156,7 @@ def execute_recovery_action(
                 transaction=transaction,
                 confidence=confidence,
                 reason=reason,
+                recorded_action_type="CREATE_PAYMENT_LINK",
             )
         elif action_type == "RETRY":
             result = _execute_retry_payment(
@@ -212,12 +225,18 @@ def _execute_create_payment_link(
     transaction: Transaction,
     confidence: float,
     reason: str,
+    recorded_action_type: str = "CREATE_PAYMENT_LINK",
 ) -> Dict[str, Any]:
     """
     Execute CREATE_PAYMENT_LINK action.
     
     This creates a Razorpay payment link for the failed transaction.
     The amount is always taken from the trusted database transaction record.
+
+    Args:
+        recorded_action_type: The action type to record on the RecoveryAction row.
+            RETRY reuses this implementation, but must be recorded as RETRY so
+            the MAX_RETRIES policy rule can see it.
     """
     logger.info(f"Creating payment link for case {case.case_id}")
     
@@ -242,7 +261,7 @@ def _execute_create_payment_link(
     # Create recovery action record
     recovery_action = RecoveryAction(
         case_id=case.id,
-        action_type="CREATE_PAYMENT_LINK",
+        action_type=recorded_action_type,
         reason=reason,
         confidence=confidence,
         policy_result="APPROVED",
@@ -254,7 +273,7 @@ def _execute_create_payment_link(
     # Update case status
     case.status = CaseStatus.RECOVERY_ATTEMPTED.value
     case.attempt_count += 1
-    case.recommended_action = "CREATE_PAYMENT_LINK"
+    case.recommended_action = recorded_action_type
     
     # Create audit event
     audit_event = AuditEvent(
@@ -264,7 +283,7 @@ def _execute_create_payment_link(
         decision="APPROVED",
         reason=f"Payment link created: {payment_link_result.get('payment_link')}",
         confidence=confidence,
-        action="CREATE_PAYMENT_LINK",
+        action=recorded_action_type,
         result="SUCCESS",
         metadata_={
             "payment_link_id": payment_link_result.get("payment_link_id"),
@@ -311,6 +330,7 @@ def _execute_retry_payment(
         transaction=transaction,
         confidence=confidence,
         reason=reason,
+        recorded_action_type="RETRY",
     )
 
 
@@ -391,6 +411,73 @@ def process_payment_success(
             "success": False,
             "error": f"Case {case_id} not found",
         }
+
+    # A CLOSED case is settled and out of the autonomous flow.  A late success
+    # event must not silently resurrect it.
+    if case.status == CaseStatus.CLOSED.value:
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="webhook",
+            decision="PAYMENT_SUCCESS_REJECTED",
+            reason=f"Payment {payment_id} captured for closed case; manual reconciliation required",
+            action="PAYMENT_RECEIVED",
+            result="IGNORED",
+            metadata_={"payment_id": payment_id, "amount": amount, "case_status": case.status},
+        ))
+        db.commit()
+        logger.warning(f"Payment success for CLOSED case {case_id} ignored; manual reconciliation required")
+        return {
+            "success": False,
+            "error": f"Case {case_id} is closed; payment requires manual reconciliation",
+            "case_id": case_id,
+            "status": case.status,
+        }
+
+    # Already recovered: never overwrite the recorded amount (repeat events are
+    # retried by the provider, and a different amount means double payment).
+    if case.status == CaseStatus.RECOVERED.value:
+        recorded = case.recovered_amount or 0.0
+        same_amount = abs(recorded - amount) <= 0.01
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="webhook",
+            decision=("PAYMENT_SUCCESS_DUPLICATE" if same_amount
+                      else "PAYMENT_SUCCESS_AMOUNT_MISMATCH"),
+            reason=(f"Case already recovered for {recorded}; event for amount {amount} "
+                    f"{'ignored' if same_amount else 'requires manual reconciliation'}"),
+            action="PAYMENT_RECEIVED",
+            result="IGNORED" if same_amount else "MISMATCH",
+            metadata_={
+                "payment_id": payment_id,
+                "amount": amount,
+                "recorded_amount": recorded,
+            },
+        ))
+        db.commit()
+        if same_amount:
+            logger.info(f"Duplicate success event for already-recovered case {case_id} ignored")
+            return {
+                "success": True,
+                "ignored": True,
+                "duplicate": True,
+                "case_id": case_id,
+                "status": case.status,
+                "recovered_amount": recorded,
+            }
+        logger.error(
+            f"Amount mismatch for recovered case {case_id}: recorded {recorded}, event {amount}"
+        )
+        return {
+            "success": False,
+            "duplicate": True,
+            "error": (f"Case {case_id} already recovered for {recorded}; "
+                      f"captured amount {amount} requires manual reconciliation"),
+            "case_id": case_id,
+            "status": case.status,
+            "recovered_amount": recorded,
+        }
     
     # Update case
     case.status = CaseStatus.RECOVERED.value
@@ -450,6 +537,36 @@ def process_payment_failure(
         return {
             "success": False,
             "error": f"Case {case_id} not found",
+        }
+
+    # Never move a settled case backwards: a late/duplicate failure event for an
+    # already recovered or closed case must not reopen it.
+    if case.status in (CaseStatus.RECOVERED.value, CaseStatus.CLOSED.value):
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="webhook",
+            decision="PAYMENT_FAILED_AFTER_SETTLEMENT",
+            reason=(f"Payment {payment_id} failed after case reached {case.status}: "
+                    f"{failure_reason}"),
+            action="PAYMENT_RECEIVED",
+            result="IGNORED",
+            metadata_={
+                "payment_id": payment_id,
+                "failure_reason": failure_reason,
+                "case_status": case.status,
+            },
+        ))
+        db.commit()
+        logger.warning(
+            f"Failure event for settled case {case_id} ({case.status}) ignored"
+        )
+        return {
+            "success": True,
+            "ignored": True,
+            "case_id": case_id,
+            "status": case.status,
+            "failure_reason": failure_reason,
         }
     
     # Update case status

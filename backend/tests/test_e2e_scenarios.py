@@ -421,17 +421,19 @@ class TestScenario3PolicyBlock:
         assert exec_result["action_executed"] is False
         assert "payment_link_id" not in exec_result
 
-        # Verify case status unchanged
+        # The case must be visibly escalated for human review
+        assert exec_result["escalated"] is True
         db_session.refresh(high_case)
-        assert high_case.status == "OPEN"
+        assert high_case.status == CaseStatus.ESCALATED.value
 
-        # Verify audit trail shows blocked action
-        blocked_audit = db_session.query(AuditEvent).filter(
+        # Verify audit trail shows the escalation
+        escalated_audit = db_session.query(AuditEvent).filter(
             AuditEvent.case_id == high_case.id,
-            AuditEvent.event_type == AuditEventType.ACTION_FAILED.value,
+            AuditEvent.event_type == AuditEventType.CASE_ESCALATED.value,
         ).first()
-        assert blocked_audit is not None
-        assert blocked_audit.result == "BLOCKED_BY_POLICY"
+        assert escalated_audit is not None
+        assert escalated_audit.actor == "recovery_service"
+        assert escalated_audit.result == "ESCALATED"
 
     def test_policy_blocks_low_confidence(self, db_session, risk_case, active_policy):
         """Test that policy blocks when AI confidence is too low."""
@@ -497,14 +499,14 @@ class TestScenario3PolicyBlock:
             recovery_probability=0.80,
         )
 
-        # Verify audit event exists
+        # Verify the escalation audit event exists
         audit = db_session.query(AuditEvent).filter(
             AuditEvent.case_id == case.id,
-            AuditEvent.event_type == AuditEventType.ACTION_FAILED.value,
+            AuditEvent.event_type == AuditEventType.CASE_ESCALATED.value,
         ).first()
         assert audit is not None
         assert audit.actor == "recovery_service"
-        assert audit.result == "BLOCKED_BY_POLICY"
+        assert audit.result == "ESCALATED"
 
 
 # ============================================================================
@@ -658,9 +660,10 @@ class TestSecurityInvariant:
             recovery_probability=0.05,
         )
 
-        # If policy blocked, execution must not have occurred
+        # If policy stopped the action, execution must not have occurred
         if not result.get("action_executed"):
-            assert "Policy blocked" in result.get("error", "")
+            assert result.get("escalated") is True
+            assert "Policy escalated" in result.get("error", "")
 
     def test_no_direct_payment_api_bypass(self, db_session, risk_case, active_policy):
         """

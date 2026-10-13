@@ -16,6 +16,7 @@ from app.models import (
     PolicyConfig,
     PolicyDecision,
     RecoveryAction,
+    RecoveryOutcome,
     AuditEvent,
     AuditEventType,
     CaseStatus,
@@ -38,16 +39,50 @@ DEFAULT_POLICY_CONFIG = {
 }
 
 
+# Recovery action execution states that must NOT count as an executed attempt.
+# A policy-blocked or escalated action was never carried out, so counting it as
+# an attempt would consume the case's recovery budget without any recovery
+# having been tried.
+_NON_EXECUTED_ACTION_STATES = [
+    RecoveryOutcome.BLOCKED_BY_POLICY.value,
+    RecoveryOutcome.ESCALATED.value,
+]
+
+
+def _impossible_policy_values(policy: PolicyConfig) -> List[str]:
+    """Return human-readable descriptions of non-functional policy values.
+
+    These are the values the ``PolicyConfigUpdate`` schema already rejects at
+    the API boundary, so they can only appear if a row was written directly to
+    the database.  They are reported, never rewritten.
+    """
+    impossible: List[str] = []
+    if policy.autonomous_amount_limit < 100:
+        impossible.append(f"autonomous_amount_limit={policy.autonomous_amount_limit}")
+    if policy.minimum_ai_confidence > 0.95:
+        impossible.append(f"minimum_ai_confidence={policy.minimum_ai_confidence}")
+    if policy.minimum_recovery_probability > 0.95:
+        impossible.append(f"minimum_recovery_probability={policy.minimum_recovery_probability}")
+    if policy.escalation_threshold > 0.95:
+        impossible.append(f"escalation_threshold={policy.escalation_threshold}")
+    if policy.case_lifetime_days < 1:
+        impossible.append(f"case_lifetime_days={policy.case_lifetime_days}")
+    return impossible
+
+
 def get_active_policy(db: Session) -> Optional[PolicyConfig]:
     """
     Get the active policy configuration.
     
     Returns the most recently updated active policy,
     or creates a default one if none exists.
-    
-    If the existing policy has values that would make recovery
-    impossible (e.g. autonomous_amount_limit=0), they are reset
-    to safe defaults.
+
+    This is a read: stored policy values are returned exactly as the operator
+    configured them.  Values that would make recovery impossible are logged as
+    a warning but are never rewritten here, because silently changing a policy
+    (in particular silently *raising* ``autonomous_amount_limit``) would grant
+    spending authority the operator never approved.  Invalid values are
+    rejected at the API boundary by ``PolicyConfigUpdate``.
     """
     policy = db.query(PolicyConfig).filter(PolicyConfig.is_active == True).first()
     
@@ -70,51 +105,14 @@ def get_active_policy(db: Session) -> Optional[PolicyConfig]:
         db.refresh(policy)
         logger.info("Created default policy configuration")
     else:
-        # Validate that the active policy has sane values.
-        # If critical thresholds are set to impossible values (e.g. by
-        # a manual API call), reset them to safe defaults so that
-        # recovery actions can actually be approved.
-        needs_reset = False
-        if policy.autonomous_amount_limit < 100:
+        # Report (never rewrite) values that would make recovery impossible.
+        impossible = _impossible_policy_values(policy)
+        if impossible:
             logger.warning(
-                f"Policy autonomous_amount_limit={policy.autonomous_amount_limit} "
-                f"is too low — resetting to {DEFAULT_POLICY_CONFIG['autonomous_amount_limit']}"
+                f"Active policy id={policy.id} contains non-functional values "
+                f"({', '.join(impossible)}). The stored configuration is left "
+                f"unchanged; update it explicitly via PUT /api/policies."
             )
-            policy.autonomous_amount_limit = DEFAULT_POLICY_CONFIG["autonomous_amount_limit"]
-            needs_reset = True
-        if policy.minimum_ai_confidence > 0.95:
-            logger.warning(
-                f"Policy minimum_ai_confidence={policy.minimum_ai_confidence} "
-                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['minimum_ai_confidence']}"
-            )
-            policy.minimum_ai_confidence = DEFAULT_POLICY_CONFIG["minimum_ai_confidence"]
-            needs_reset = True
-        if policy.minimum_recovery_probability > 0.95:
-            logger.warning(
-                f"Policy minimum_recovery_probability={policy.minimum_recovery_probability} "
-                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['minimum_recovery_probability']}"
-            )
-            policy.minimum_recovery_probability = DEFAULT_POLICY_CONFIG["minimum_recovery_probability"]
-            needs_reset = True
-        if policy.escalation_threshold > 0.95:
-            logger.warning(
-                f"Policy escalation_threshold={policy.escalation_threshold} "
-                f"is too high — resetting to {DEFAULT_POLICY_CONFIG['escalation_threshold']}"
-            )
-            policy.escalation_threshold = DEFAULT_POLICY_CONFIG["escalation_threshold"]
-            needs_reset = True
-        if policy.case_lifetime_days < 1:
-            logger.warning(
-                f"Policy case_lifetime_days={policy.case_lifetime_days} "
-                f"is too low — resetting to {DEFAULT_POLICY_CONFIG['case_lifetime_days']}"
-            )
-            policy.case_lifetime_days = DEFAULT_POLICY_CONFIG["case_lifetime_days"]
-            needs_reset = True
-        if needs_reset:
-            policy.description = "Policy reset to safe defaults (previous values were non-functional)"
-            db.commit()
-            db.refresh(policy)
-            logger.info("Policy configuration corrected to safe defaults")
     
     return policy
 
@@ -124,6 +122,7 @@ def check_retry_limit(db: Session, case: RevenueRiskCase, policy: PolicyConfig) 
     retry_count = db.query(RecoveryAction).filter(
         RecoveryAction.case_id == case.id,
         RecoveryAction.action_type == RecoveryActionEnum.RETRY.value,
+        RecoveryAction.execution_status.notin_(_NON_EXECUTED_ACTION_STATES),
     ).count()
     
     passed = retry_count < policy.max_retries
@@ -142,6 +141,7 @@ def check_reminder_limit(db: Session, case: RevenueRiskCase, policy: PolicyConfi
     reminder_count = db.query(RecoveryAction).filter(
         RecoveryAction.case_id == case.id,
         RecoveryAction.action_type == RecoveryActionEnum.SEND_PAYMENT_REMINDER.value,
+        RecoveryAction.execution_status.notin_(_NON_EXECUTED_ACTION_STATES),
     ).count()
     
     passed = reminder_count < policy.max_reminders
@@ -164,6 +164,7 @@ def check_recovery_attempts(db: Session, case: RevenueRiskCase, policy: PolicyCo
             RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
             RecoveryActionEnum.SEND_PAYMENT_REMINDER.value,
         ]),
+        RecoveryAction.execution_status.notin_(_NON_EXECUTED_ACTION_STATES),
     ).count()
     
     passed = attempt_count < policy.max_recovery_attempts
@@ -276,6 +277,7 @@ def evaluate_action(
     proposed_action: str,
     confidence: float,
     recovery_probability: float,
+    persist: bool = True,
 ) -> PolicyDecisionResponse:
     """
     Evaluate a proposed action against policy rules.
@@ -289,6 +291,11 @@ def evaluate_action(
         proposed_action: Action proposed by AI agent
         confidence: AI confidence in recommendation
         recovery_probability: ML-predicted recovery probability
+        persist: When False the decision is evaluated but NOT written to the
+            database.  This is for read-only pre-checks such as ranking
+            candidate actions by value; it is never an authorization.  Every
+            evaluation that gates an action keeps the default persist=True and
+            is the authoritative record.
         
     Returns:
         PolicyDecisionResponse with decision and checks
@@ -316,35 +323,35 @@ def evaluate_action(
     checks.append(check)
     if not check.passed:
         return _create_decision(db, case, proposed_action, "BLOCKED", 
-                               "Payment already successful", checks, confidence, recovery_probability)
+                               "Payment already successful", checks, confidence, recovery_probability, persist=persist)
     
     # Check case expiry
     check = check_case_expiry(case, policy)
     checks.append(check)
     if not check.passed:
         return _create_decision(db, case, proposed_action, "BLOCKED",
-                               "Case has expired", checks, confidence, recovery_probability)
+                               "Case has expired", checks, confidence, recovery_probability, persist=persist)
     
     # Check retry limit
     check = check_retry_limit(db, case, policy)
     checks.append(check)
     if not check.passed and proposed_action == RecoveryActionEnum.RETRY.value:
         return _create_decision(db, case, proposed_action, "BLOCKED",
-                               "Retry limit reached", checks, confidence, recovery_probability)
+                               "Retry limit reached", checks, confidence, recovery_probability, persist=persist)
     
     # Check reminder limit
     check = check_reminder_limit(db, case, policy)
     checks.append(check)
     if not check.passed and proposed_action == RecoveryActionEnum.SEND_PAYMENT_REMINDER.value:
         return _create_decision(db, case, proposed_action, "BLOCKED",
-                               "Reminder limit reached", checks, confidence, recovery_probability)
+                               "Reminder limit reached", checks, confidence, recovery_probability, persist=persist)
     
     # Check recovery attempts
     check = check_recovery_attempts(db, case, policy)
     checks.append(check)
     if not check.passed:
         return _create_decision(db, case, proposed_action, "BLOCKED",
-                               "Recovery attempt limit reached", checks, confidence, recovery_probability)
+                               "Recovery attempt limit reached", checks, confidence, recovery_probability, persist=persist)
     
     # Check amount limit
     check = check_amount_limit(case, policy)
@@ -352,7 +359,7 @@ def evaluate_action(
     if not check.passed:
         # Amount exceeds limit - escalate to human
         return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "Amount exceeds autonomous limit", checks, confidence, recovery_probability)
+                               "Amount exceeds autonomous limit", checks, confidence, recovery_probability, persist=persist)
     
     # Check AI confidence
     check = check_ai_confidence(confidence, policy)
@@ -360,7 +367,7 @@ def evaluate_action(
     if not check.passed:
         # Low confidence - escalate to human
         return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "AI confidence below minimum threshold", checks, confidence, recovery_probability)
+                               "AI confidence below minimum threshold", checks, confidence, recovery_probability, persist=persist)
     
     # Check recovery probability
     check = check_recovery_probability(recovery_probability, policy)
@@ -368,7 +375,7 @@ def evaluate_action(
     if not check.passed:
         # Low recovery probability - escalate or no action
         return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "Recovery probability below minimum threshold", checks, confidence, recovery_probability)
+                               "Recovery probability below minimum threshold", checks, confidence, recovery_probability, persist=persist)
     
     # Check escalation threshold
     check = check_escalation_threshold(confidence, policy)
@@ -376,7 +383,7 @@ def evaluate_action(
     
     # All checks passed - approve the action
     return _create_decision(db, case, proposed_action, "APPROVED",
-                           "All policy checks passed", checks, confidence, recovery_probability)
+                           "All policy checks passed", checks, confidence, recovery_probability, persist=persist)
 
 
 def _create_decision(
@@ -388,37 +395,39 @@ def _create_decision(
     checks: List[PolicyCheck],
     confidence: float,
     recovery_probability: float,
+    persist: bool = True,
 ) -> PolicyDecisionResponse:
-    """Create and store a policy decision."""
-    # Store decision in database
-    policy_decision = PolicyDecision(
-        case_id=case.id,
-        proposed_action=proposed_action,
-        decision=decision,
-        reason=reason,
-        checks=[check.model_dump() for check in checks],
-        confidence=confidence,
-        recovery_probability=recovery_probability,
-        amount=case.amount,
-        final_decision=decision,
-    )
-    db.add(policy_decision)
-    
-    # Create audit event
-    audit_event = AuditEvent(
-        case_id=case.id,
-        event_type=AuditEventType.POLICY_CHECKED.value,
-        actor="policy_engine",
-        decision=decision,
-        reason=reason,
-        confidence=confidence,
-        policy_checks=[check.model_dump() for check in checks],
-        action=proposed_action,
-        result=decision,
-    )
-    db.add(audit_event)
-    
-    db.commit()
+    """Create a policy decision and, unless ``persist`` is False, store it."""
+    if persist:
+        # Store decision in database
+        policy_decision = PolicyDecision(
+            case_id=case.id,
+            proposed_action=proposed_action,
+            decision=decision,
+            reason=reason,
+            checks=[check.model_dump() for check in checks],
+            confidence=confidence,
+            recovery_probability=recovery_probability,
+            amount=case.amount,
+            final_decision=decision,
+        )
+        db.add(policy_decision)
+        
+        # Create audit event
+        audit_event = AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.POLICY_CHECKED.value,
+            actor="policy_engine",
+            decision=decision,
+            reason=reason,
+            confidence=confidence,
+            policy_checks=[check.model_dump() for check in checks],
+            action=proposed_action,
+            result=decision,
+        )
+        db.add(audit_event)
+        
+        db.commit()
     
     logger.info(f"Policy decision for case {case.case_id}: {decision} - {reason}")
     

@@ -465,6 +465,34 @@ class TestAgentService:
         assert sample_case.diagnosis is not None
         assert sample_case.recommended_action is not None
 
+    def test_diagnose_case_does_not_reopen_recovered_case(self, db_session, sample_case):
+        """
+        Regression test (stop after success): diagnosing a settled case must not
+        run the LLM or drag the case back to IN_PROGRESS.
+        """
+        sample_case.status = CaseStatus.RECOVERED.value
+        sample_case.recovered_amount = 2500.0
+        db_session.commit()
+
+        result = diagnose_case(db_session, "CASE-001")
+
+        assert result["success"] is False
+        assert result["skipped"] is True
+        assert result["status"] == CaseStatus.RECOVERED.value
+
+        db_session.refresh(sample_case)
+        assert sample_case.status == CaseStatus.RECOVERED.value
+        assert sample_case.recovered_amount == 2500.0
+        assert sample_case.recommended_action is None
+        assert sample_case.diagnosis is None
+
+        # No diagnosis work was recorded for a settled case
+        audits = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == sample_case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+        ).all()
+        assert audits == []
+
 
 # ============================================================================
 # API ENDPOINT TESTS

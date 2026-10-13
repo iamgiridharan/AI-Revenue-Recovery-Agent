@@ -96,6 +96,181 @@ function Timeline({ events }) {
   );
 }
 
+const COST_SOURCE_LABELS = {
+  not_configured: 'not configured — net recovery not computed',
+  configured_template: 'configured (deployment template)',
+  caller_supplied: 'supplied by caller',
+};
+
+const PROBABILITY_SOURCE_LABELS = {
+  case_level_ml_model: 'ML model (case-level, not action-specific)',
+  caller_supplied: 'supplied by caller',
+  unavailable: 'unavailable — estimate not computed',
+};
+
+function formatPercent(value) {
+  if (value === null || value === undefined) return '-';
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatEstimate(value) {
+  if (value === null || value === undefined) return 'not computed';
+  return formatCurrency(value);
+}
+
+function ValueAssessment({ assessment }) {
+  if (!assessment) return null;
+
+  const inputs = assessment.inputs || {};
+  const penalties = assessment.penalties || {};
+  const candidates = assessment.candidates || [];
+  const excluded = assessment.excluded_candidates || [];
+
+  return (
+    <Section title="Estimated Recovery Value">
+      {/* Explicit estimate labelling */}
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[10px] font-bold tracking-wide px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+          {assessment.estimate_label || 'ESTIMATE'}
+        </span>
+        <span className="text-xs text-gray-500">
+          Estimates only. Actual recovered revenue is {formatCurrency(assessment.actual_recovered_amount)}
+          {' '}and is set only by a verified payment webhook.
+        </span>
+      </div>
+
+      {/* Formula, shown exactly as executed */}
+      <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-3 space-y-1">
+        <p className="text-xs font-mono text-gray-600">
+          expected gross = {formatCurrency(inputs.payment_amount)} × {formatPercent(inputs.recovery_probability)}
+        </p>
+        <p className="text-xs font-mono text-gray-600">
+          expected net = expected gross − intervention cost
+        </p>
+        <p className="text-xs font-mono text-gray-600">
+          utility score = expected net − configured penalties
+        </p>
+      </div>
+
+      {/* Inputs and their provenance */}
+      <div className="grid grid-cols-2 gap-x-6 mb-3">
+        <InfoRow label="Payment Amount" value={formatCurrency(inputs.payment_amount)} />
+        <InfoRow label="Recovery Probability" value={formatPercent(inputs.recovery_probability)} />
+        <InfoRow
+          label="Probability Source"
+          value={PROBABILITY_SOURCE_LABELS[inputs.recovery_probability_source] || inputs.recovery_probability_source}
+        />
+        <InfoRow
+          label="Intervention Cost Source"
+          value={COST_SOURCE_LABELS[assessment.intervention_cost_source] || assessment.intervention_cost_source}
+        />
+      </div>
+
+      {/* Figures, kept separately inspectable */}
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="border border-gray-100 rounded-lg p-3">
+          <p className="text-xs text-gray-500">Estimated Gross Recovery</p>
+          <p className="text-lg font-semibold text-gray-900">{formatEstimate(assessment.expected_gross_recovery)}</p>
+        </div>
+        <div className="border border-gray-100 rounded-lg p-3">
+          <p className="text-xs text-gray-500">Estimated Intervention Cost</p>
+          <p className="text-lg font-semibold text-gray-900">{formatEstimate(assessment.intervention_cost)}</p>
+        </div>
+        <div className="border border-gray-100 rounded-lg p-3">
+          <p className="text-xs text-gray-500">Estimated Net Recovery</p>
+          <p className="text-lg font-semibold text-gray-900">{formatEstimate(assessment.expected_net_recovery)}</p>
+        </div>
+        <div className="border border-gray-100 rounded-lg p-3">
+          <p className="text-xs text-gray-500">Utility Score (penalties applied)</p>
+          <p className="text-lg font-semibold text-gray-900">{formatEstimate(assessment.utility_score)}</p>
+          <p className="text-[10px] text-gray-400 mt-0.5">
+            not a monetary figure; penalties: {formatCurrency(penalties.total_penalties || 0)}
+          </p>
+        </div>
+      </div>
+
+      {assessment.figures_scope && (
+        <p className="text-xs text-gray-500 mb-3">{assessment.figures_scope}</p>
+      )}
+      {assessment.ranking_note && (
+        <p className="text-xs text-gray-500 mb-3">{assessment.ranking_note}</p>
+      )}
+
+      {/* Candidate ranking (advisory only) */}
+      {candidates.length > 0 ? (
+        <div className="mb-3">
+          <p className="text-xs font-semibold text-gray-600 mb-2 uppercase tracking-wide">
+            Ranked eligible candidates
+          </p>
+          <div className="space-y-2">
+            {candidates.map((candidate) => (
+              <div key={candidate.action} className="border border-gray-100 rounded-lg p-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-sm font-medium text-gray-900">
+                    #{candidate.rank} {candidate.action.replace(/_/g, ' ')}
+                  </span>
+                  {candidate.action === assessment.recommended_action && (
+                    <span className="text-xs px-2 py-0.5 rounded bg-green-50 text-green-700">highest value</span>
+                  )}
+                </div>
+                <div className="text-xs text-gray-500">
+                  gross {formatEstimate(candidate.expected_gross_recovery)} · cost{' '}
+                  {formatEstimate(candidate.intervention_cost)} · net{' '}
+                  {formatEstimate(candidate.expected_net_recovery)} · utility{' '}
+                  {formatEstimate(candidate.utility_score)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-gray-500 mb-3">
+          No eligible recovery action for this case.
+        </p>
+      )}
+
+      {/* Excluded candidates with reasons */}
+      {excluded.length > 0 && (
+        <div className="mb-3">
+          <p className="text-xs font-semibold text-gray-600 mb-2 uppercase tracking-wide">
+            Excluded from ranking
+          </p>
+          <div className="space-y-1">
+            {excluded.map((candidate) => (
+              <div key={candidate.action} className="text-xs text-gray-500">
+                <span className="font-medium text-gray-700">{candidate.action.replace(/_/g, ' ')}</span>
+                {' — '}{candidate.eligibility_reason}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Assumptions and limitations, so the estimate is not over-read */}
+      {assessment.assumptions && assessment.assumptions.length > 0 && (
+        <div className="mb-2">
+          <p className="text-xs font-semibold text-gray-600 mb-1">Assumptions</p>
+          <ul className="list-disc list-inside space-y-0.5">
+            {assessment.assumptions.map((line, idx) => (
+              <li key={idx} className="text-[11px] text-gray-500">{line}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {assessment.limitations && assessment.limitations.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-gray-600 mb-1">Limitations</p>
+          <ul className="list-disc list-inside space-y-0.5">
+            {assessment.limitations.map((line, idx) => (
+              <li key={idx} className="text-[11px] text-gray-500">{line}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Section>
+  );
+}
+
 export default function CaseDetail() {
   const { id } = useParams();
   const [data, setData] = useState(null);
@@ -141,7 +316,12 @@ export default function CaseDetail() {
 
   if (!data) return null;
 
-  const { case: caseData, customer, transaction, recovery_actions, audit_events } = data;
+  const { case: caseData, customer, transaction, recovery_actions, audit_events, value_assessment } = data;
+
+  // Keep the estimate and the actual recovered revenue visibly distinct.
+  const valueAssessment = value_assessment
+    ? { ...value_assessment, actual_recovered_amount: caseData.recovered_amount }
+    : null;
 
   return (
     <div className="space-y-6">
@@ -182,6 +362,9 @@ export default function CaseDetail() {
               <InfoRow label="Recommended Action" value={caseData.recommended_action?.replace(/_/g, ' ') || '-'} />
             </div>
           </Section>
+
+          {/* Estimated recovery value (estimates only) */}
+          <ValueAssessment assessment={valueAssessment} />
 
           {/* Diagnosis */}
           {caseData.diagnosis && (

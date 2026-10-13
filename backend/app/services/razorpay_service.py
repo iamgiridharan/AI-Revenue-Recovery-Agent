@@ -183,14 +183,24 @@ def verify_webhook_signature(
         
     Returns:
         True if signature is valid, False otherwise
+
+    Verification FAILS CLOSED: if no webhook secret is configured the request is
+    rejected instead of trusted, because an unverified webhook can mark cases as
+    recovered with an attacker-chosen amount. Configure
+    ``RAZORPAY_WEBHOOK_SECRET`` to accept webhook deliveries.
     """
     webhook_secret = secret or settings.RAZORPAY_WEBHOOK_SECRET
     
     if not webhook_secret:
-        logger.warning("Webhook secret not configured. Skipping signature verification.")
-        # In development, we might skip verification
-        # In production, this should always be True
-        return True
+        logger.error(
+            "Webhook secret is not configured. Rejecting webhook: signature "
+            "cannot be verified. Set RAZORPAY_WEBHOOK_SECRET to enable webhooks."
+        )
+        return False
+
+    if not signature:
+        logger.warning("Webhook request has no X-Razorpay-Signature header. Rejecting.")
+        return False
     
     try:
         # Razorpay uses HMAC SHA256 for signature verification
@@ -224,23 +234,43 @@ def parse_webhook_event(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     try:
         event = payload.get("event", "")
-        entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+        entities = payload.get("payload", {}) or {}
+        entity = (entities.get("payment") or {}).get("entity") or {}
+        # payment_link.* events carry the case reference on the payment_link
+        # entity, not on the payment entity.
+        link_entity = (entities.get("payment_link") or {}).get("entity") or {}
+
+        entity_amount = entity.get("amount")
+        link_amount = link_entity.get("amount")
+        if entity_amount is not None:
+            amount = entity_amount / 100  # Convert from paise to INR
+        elif link_amount is not None:
+            amount = link_amount / 100
+        else:
+            amount = 0
         
         # Extract payment details
         payment_data = {
             "event_type": event,
             "payment_id": entity.get("id"),
             "order_id": entity.get("order_id"),
-            "amount": entity.get("amount", 0) / 100,  # Convert from paise to INR
-            "currency": entity.get("currency"),
-            "status": entity.get("status"),
+            "amount": amount,
+            "currency": entity.get("currency") or link_entity.get("currency"),
+            "status": entity.get("status") or link_entity.get("status"),
             "method": entity.get("method"),
             "email": entity.get("email"),
             "contact": entity.get("contact"),
-            "created_at": entity.get("created_at"),
+            "created_at": entity.get("created_at") or link_entity.get("created_at"),
             "captured": entity.get("captured"),
-            "description": entity.get("description"),
-            "notes": entity.get("notes", {}),
+            "description": entity.get("description") or link_entity.get("description"),
+            # reference_id is what maps a webhook back to a revenue risk case.
+            "reference_id": entity.get("reference_id") or link_entity.get("reference_id"),
+            "payment_link_id": link_entity.get("id"),
+            "payment_link_status": link_entity.get("status"),
+            "notes": {
+                **(link_entity.get("notes") or {}),
+                **(entity.get("notes") or {}),
+            },
         }
         
         logger.info(f"Parsed webhook event: {event} for payment {payment_data['payment_id']}")

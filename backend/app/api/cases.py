@@ -2,8 +2,9 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.services.case_service import get_cases, get_case_by_id
+from app.services.value_service import assess_case_value_by_id
 from app.schemas.case import CaseListResponse, CaseDetailResponse
-from app.utils.errors import NotFoundError
+from app.utils.errors import AppError, NotFoundError
 
 router = APIRouter(tags=["cases"])
 
@@ -63,3 +64,33 @@ def get_case(case_id: str, db: Session = Depends(get_db)):
         success=True,
         data=case,
     )
+
+
+@router.get("/cases/{case_id}/value")
+def get_case_value(case_id: str, db: Session = Depends(get_db)):
+    """
+    Estimate the recoverable value of a case (value-aware recovery scoring).
+
+    Returns the formula, inputs with their provenance, the estimated gross
+    recovery, the (separately inspectable) intervention cost, the estimated net
+    recovery and the separately labelled utility score, plus the ranked eligible
+    candidate actions and the excluded ones with reasons.
+
+    This endpoint is READ-ONLY and advisory: it ranks candidates and never
+    authorizes or executes anything. Every monetary figure is an estimate, not
+    booked revenue, and the Policy Engine remains the authorization authority.
+    """
+    try:
+        assessment = assess_case_value_by_id(db, case_id)
+    except ValueError as exc:
+        # A malformed stored value (e.g. a probability outside [0, 1]) is a
+        # client-visible data problem, not a server crash.
+        raise AppError(message=f"Cannot assess case {case_id}: {exc}", status_code=422)
+
+    if assessment is None:
+        raise NotFoundError(f"Revenue risk case '{case_id}' not found")
+
+    return {
+        "success": True,
+        "data": assessment,
+    }
