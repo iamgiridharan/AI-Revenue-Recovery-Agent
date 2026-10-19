@@ -55,7 +55,6 @@ def active_policy(db_session):
         minimum_ai_confidence=0.3,
         minimum_recovery_probability=0.2,
         case_lifetime_days=7,
-        escalation_threshold=0.7,
         is_active=True,
         description="Test policy",
     )

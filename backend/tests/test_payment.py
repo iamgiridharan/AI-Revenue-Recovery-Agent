@@ -24,6 +24,7 @@ from app.models import (
     AuditEvent,
     PolicyConfig,
     PolicyDecision,
+    WebhookEvent,
     CaseStatus,
     AuditEventType,
 )
@@ -106,7 +107,6 @@ def active_policy(db_session):
         minimum_ai_confidence=0.3,
         minimum_recovery_probability=0.2,
         case_lifetime_days=7,
-        escalation_threshold=0.7,
         is_active=True,
         description="Test policy",
     )
@@ -581,7 +581,6 @@ class TestWebhookHandler:
     def test_webhook_duplicate_event(self, client, db_session, risk_case):
         """Test duplicate webhook event is ignored."""
         import json
-        from app.api.webhooks import _processed_events
 
         payload = {
             "event": "payment.captured",
@@ -1000,9 +999,7 @@ class TestWebhookSecurityAndIdempotency:
         provider's retry was discarded as a duplicate and the payment was lost.
         """
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         payload = _captured_payload("pay_retry_1")
 
         with patch("app.api.webhooks.verify_webhook_signature", return_value=True), \
@@ -1020,7 +1017,11 @@ class TestWebhookSecurityAndIdempotency:
                 },
             )
         assert first.status_code == 500
-        assert "evt_retry_1" not in webhooks._processed_events
+        # A failed delivery must not be recorded as processed, or the
+        # provider's retry would be discarded as a duplicate.
+        assert db_session.query(WebhookEvent).filter(
+            WebhookEvent.event_id == "evt_retry_1"
+        ).first() is None
 
         with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
             second = client.post(
@@ -1042,9 +1043,7 @@ class TestWebhookSecurityAndIdempotency:
     def test_provider_event_id_header_is_honoured(self, client, db_session, risk_case):
         """Two distinct deliveries of the same payload are not collapsed."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         payload = _captured_payload("pay_event_id_1")
 
         with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
@@ -1093,9 +1092,7 @@ class TestWebhookSecurityAndIdempotency:
         payment_link entity, so it must mark the case recovered.
         """
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         payload = {
             "event": "payment_link.paid",
             "payload": {
@@ -1139,9 +1136,7 @@ class TestWebhookSecurityAndIdempotency:
     def test_late_failure_does_not_reopen_recovered_case(self, client, db_session, risk_case):
         """A failure event arriving after recovery must not reopen the case."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         risk_case.status = CaseStatus.RECOVERED.value
         risk_case.recovered_amount = 2500.0
         db_session.commit()
@@ -1180,9 +1175,7 @@ class TestWebhookSecurityAndIdempotency:
     def test_success_on_closed_case_is_not_resurrected(self, client, db_session, risk_case):
         """A closed case must not be silently marked recovered by a late capture."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         risk_case.status = CaseStatus.CLOSED.value
         db_session.commit()
 
@@ -1216,9 +1209,7 @@ class TestWebhookSecurityAndIdempotency:
     ):
         """A repeat capture with a different amount must not overwrite the record."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
         risk_case.status = CaseStatus.RECOVERED.value
         risk_case.recovered_amount = 2500.0
         db_session.commit()
@@ -1265,9 +1256,7 @@ class TestCapturedAmountVerification:
     def test_non_positive_capture_does_not_settle_case(self, client, db_session, risk_case):
         """A zero-amount capture must not mark the case recovered."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
 
         with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
             response = client.post(
@@ -1315,9 +1304,7 @@ class TestCapturedAmountVerification:
     def test_partial_capture_requires_manual_reconciliation(self, client, db_session, risk_case):
         """A capture for less than the case amount must not settle the case."""
         import json
-        import app.api.webhooks as webhooks
 
-        webhooks._processed_events.clear()
 
         with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
             response = client.post(
@@ -1369,14 +1356,12 @@ class TestCapturedAmountVerification:
         import hmac
         import json
 
-        import app.api.webhooks as webhooks
         import app.services.razorpay_service as razorpay_service
 
         secret = "test_webhook_secret"
         monkeypatch.setattr(
             razorpay_service.settings, "RAZORPAY_WEBHOOK_SECRET", secret, raising=False
         )
-        webhooks._processed_events.clear()
 
         body = json.dumps(_captured_payload("pay_badsig_1"))
         response = client.post(
@@ -1397,7 +1382,9 @@ class TestCapturedAmountVerification:
         assert db_session.query(AuditEvent).filter(
             AuditEvent.case_id == risk_case.id
         ).count() == 0
-        assert "evt_badsig_1" not in webhooks._processed_events
+        assert db_session.query(WebhookEvent).filter(
+            WebhookEvent.event_id == "evt_badsig_1"
+        ).first() is None
 
         # The same delivery, correctly signed, is still processed.
         signature = hmac.new(

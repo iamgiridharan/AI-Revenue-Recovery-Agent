@@ -38,10 +38,6 @@ class PolicyConfig(Base):
     case_lifetime_days = Column(Integer, nullable=False, default=7,
                                 comment="Maximum case lifetime in days")
     
-    # Escalation
-    escalation_threshold = Column(Float, nullable=False, default=0.7,
-                                  comment="Confidence threshold above which escalation is triggered")
-    
     # Status
     is_active = Column(Boolean, nullable=False, default=True,
                        comment="Whether this policy configuration is active")

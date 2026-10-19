@@ -68,7 +68,6 @@ export default function Policy() {
       if (config.minimum_ai_confidence !== originalConfig.minimum_ai_confidence) updates.minimum_ai_confidence = config.minimum_ai_confidence;
       if (config.minimum_recovery_probability !== originalConfig.minimum_recovery_probability) updates.minimum_recovery_probability = config.minimum_recovery_probability;
       if (config.case_lifetime_days !== originalConfig.case_lifetime_days) updates.case_lifetime_days = config.case_lifetime_days;
-      if (config.escalation_threshold !== originalConfig.escalation_threshold) updates.escalation_threshold = config.escalation_threshold;
 
       const res = await updatePolicyConfig(updates);
       setConfig(res);
@@ -200,19 +199,9 @@ export default function Policy() {
         </div>
       </div>
 
-      {/* Escalation */}
-      <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-4">
-        <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Escalation</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <InputField
-            label="Escalation Threshold"
-            value={config.escalation_threshold}
-            onChange={(v) => handleChange('escalation_threshold', v)}
-            min={0.0} max={1.0} step={0.05}
-            description="Confidence above this threshold triggers escalation"
-          />
-        </div>
-      </div>
+      {/* Escalation has no separate setting: the case is escalated to human review
+          when a policy limit is exceeded (amount, AI confidence or recovery
+          probability), and those limits are configured above. */}
 
       {/* Action Buttons */}
       <div className="flex items-center justify-between">

@@ -261,7 +261,6 @@ class TestPolicyConfiguration:
         assert policy.minimum_ai_confidence == 0.3
         assert policy.minimum_recovery_probability == 0.2
         assert policy.case_lifetime_days == 7
-        assert policy.escalation_threshold == 0.7
 
     def test_get_active_policy_returns_existing(self, db_session):
         """Test that getting active policy returns existing one."""
@@ -297,7 +296,6 @@ class TestPolicyConfiguration:
             minimum_ai_confidence=0.98,     # above the API maximum
             minimum_recovery_probability=0.2,
             case_lifetime_days=7,
-            escalation_threshold=0.7,
             is_active=True,
             description="operator-defined strict policy",
         )
@@ -1050,3 +1048,87 @@ class TestTerminalAndHumanReviewGates:
         ).first()
         assert blocked_action is not None
         assert blocked_action.policy_result == "BLOCKED"
+
+
+# ============================================================================
+# ESCALATION_THRESHOLD REMOVAL
+# ============================================================================
+
+
+class TestEscalationThresholdRemoved:
+    """
+    Regression tests for the removal of the inactive ESCALATION_THRESHOLD setting.
+
+    The setting was stored, validated, returned by the API and editable in the UI,
+    but its check hard-coded ``passed=True`` and the result was never branched on,
+    so it could not influence a single decision.  Escalation is driven by the rules
+    that actually gate an action: AUTONOMOUS_AMOUNT_LIMIT, MINIMUM_AI_CONFIDENCE and
+    MINIMUM_RECOVERY_PROBABILITY.  These tests keep the duplicate from returning as a
+    no-op, and prove that removing it changed no real policy behaviour.
+    """
+
+    def test_policy_config_has_no_escalation_threshold_column(self):
+        """The column is gone from the model, not merely unused."""
+        assert "escalation_threshold" not in PolicyConfig.__table__.columns
+        assert not hasattr(PolicyConfig(), "escalation_threshold")
+
+    def test_default_policy_config_has_no_escalation_threshold(self):
+        from app.services.policy_engine import DEFAULT_POLICY_CONFIG
+
+        assert "escalation_threshold" not in DEFAULT_POLICY_CONFIG
+
+    def test_policy_engine_has_no_escalation_threshold_check(self):
+        import app.services.policy_engine as policy_engine
+
+        assert not hasattr(policy_engine, "check_escalation_threshold")
+
+    def test_api_does_not_expose_escalation_threshold(self, client, sample_case):
+        response = client.get("/api/policies")
+
+        assert response.status_code == 200
+        assert "escalation_threshold" not in response.json()
+
+    def test_put_policy_cannot_set_escalation_threshold(self, client, sample_case):
+        """A request carrying only the removed setting must not silently succeed."""
+        response = client.put("/api/policies", json={"escalation_threshold": 0.5})
+
+        assert response.status_code == 400
+        assert "No fields to update" in response.json()["detail"]
+
+        assert "escalation_threshold" not in client.get("/api/policies").json()
+
+    def test_evaluate_action_reports_no_escalation_rule(self, db_session, sample_case):
+        """A removed rule must not linger in the recorded policy checks."""
+        result = evaluate_action(
+            db=db_session,
+            case_id="CASE-001",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.9,
+            recovery_probability=0.8,
+        )
+
+        assert result.decision == "APPROVED"
+        assert "ESCALATION_THRESHOLD" not in [check.rule for check in result.checks]
+
+    def test_minimum_ai_confidence_still_gates_actions(self, db_session, sample_case):
+        """Removing the duplicate must not weaken MINIMUM_AI_CONFIDENCE."""
+        low = evaluate_action(
+            db=db_session,
+            case_id="CASE-001",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.1,
+            recovery_probability=0.8,
+        )
+        assert low.allowed is False
+        assert low.decision == "ESCALATED"
+        assert any(c.rule == "MINIMUM_AI_CONFIDENCE" and not c.passed for c in low.checks)
+
+        high = evaluate_action(
+            db=db_session,
+            case_id="CASE-001",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.9,
+            recovery_probability=0.8,
+        )
+        assert high.decision == "APPROVED"
+        assert any(c.rule == "MINIMUM_AI_CONFIDENCE" and c.passed for c in high.checks)

@@ -35,7 +35,6 @@ DEFAULT_POLICY_CONFIG = {
     "minimum_ai_confidence": 0.3,
     "minimum_recovery_probability": 0.2,
     "case_lifetime_days": 7,
-    "escalation_threshold": 0.7,
 }
 
 
@@ -63,8 +62,6 @@ def _impossible_policy_values(policy: PolicyConfig) -> List[str]:
         impossible.append(f"minimum_ai_confidence={policy.minimum_ai_confidence}")
     if policy.minimum_recovery_probability > 0.95:
         impossible.append(f"minimum_recovery_probability={policy.minimum_recovery_probability}")
-    if policy.escalation_threshold > 0.95:
-        impossible.append(f"escalation_threshold={policy.escalation_threshold}")
     if policy.case_lifetime_days < 1:
         impossible.append(f"case_lifetime_days={policy.case_lifetime_days}")
     return impossible
@@ -96,7 +93,6 @@ def get_active_policy(db: Session) -> Optional[PolicyConfig]:
             minimum_ai_confidence=DEFAULT_POLICY_CONFIG["minimum_ai_confidence"],
             minimum_recovery_probability=DEFAULT_POLICY_CONFIG["minimum_recovery_probability"],
             case_lifetime_days=DEFAULT_POLICY_CONFIG["case_lifetime_days"],
-            escalation_threshold=DEFAULT_POLICY_CONFIG["escalation_threshold"],
             is_active=True,
             description="Default policy configuration",
         )
@@ -297,21 +293,6 @@ def check_human_review_required(case: RevenueRiskCase) -> PolicyCheck:
     )
 
 
-def check_escalation_threshold(confidence: float, policy: PolicyConfig) -> PolicyCheck:
-    """Check if confidence is above escalation threshold."""
-    # This check is informational - if confidence is above threshold,
-    # escalation may be required
-    above_threshold = confidence > policy.escalation_threshold
-    
-    return PolicyCheck(
-        rule="ESCALATION_THRESHOLD",
-        passed=True,  # This is informational, not a blocker
-        reason=f"Confidence {confidence:.2f} {'above' if above_threshold else 'below'} escalation threshold {policy.escalation_threshold}",
-        value=confidence,
-        limit=policy.escalation_threshold,
-    )
-
-
 def evaluate_action(
     db: Session,
     case_id: str,
@@ -432,10 +413,6 @@ def evaluate_action(
         # Low recovery probability - escalate or no action
         return _create_decision(db, case, proposed_action, "ESCALATED",
                                "Recovery probability below minimum threshold", checks, confidence, recovery_probability, persist=persist)
-    
-    # Check escalation threshold
-    check = check_escalation_threshold(confidence, policy)
-    checks.append(check)
     
     # All checks passed - approve the action
     return _create_decision(db, case, proposed_action, "APPROVED",

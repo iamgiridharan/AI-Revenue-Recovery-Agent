@@ -38,7 +38,6 @@ class PolicyConfigResponse(BaseModel):
     minimum_ai_confidence: float
     minimum_recovery_probability: float
     case_lifetime_days: int
-    escalation_threshold: float
     is_active: bool
     description: Optional[str] = None
     created_at: datetime
@@ -63,8 +62,6 @@ class PolicyConfigUpdate(BaseModel):
                                                           description="Minimum recovery probability required")
     case_lifetime_days: Optional[int] = Field(None, ge=1, le=90,
                                               description="Maximum case lifetime in days")
-    escalation_threshold: Optional[float] = Field(None, ge=0.0, le=1.0,
-                                                  description="Confidence threshold above which escalation is triggered")
     is_active: Optional[bool] = Field(None, description="Whether this policy configuration is active")
     description: Optional[str] = Field(None, description="Description of this policy configuration")
     
@@ -98,14 +95,6 @@ class PolicyConfigUpdate(BaseModel):
             raise ValueError("Minimum recovery probability cannot exceed 0.95 (no model predicts perfect recovery)")
         return v
     
-    @field_validator("escalation_threshold")
-    @classmethod
-    def validate_escalation_threshold(cls, v):
-        """Prevent escalation threshold from being impossibly high."""
-        if v is not None and v > 0.95:
-            raise ValueError("Escalation threshold cannot exceed 0.95")
-        return v
-
 
 class PolicyDecisionCreate(BaseModel):
     """Schema for creating a policy decision record."""

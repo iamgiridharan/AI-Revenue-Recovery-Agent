@@ -19,6 +19,7 @@ from app.models.recovery_action import RecoveryAction      # noqa: F401
 from app.models.audit_event import AuditEvent              # noqa: F401
 from app.models.policy_config import PolicyConfig          # noqa: F401
 from app.models.policy_decision import PolicyDecision      # noqa: F401
+from app.models.webhook_event import WebhookEvent          # noqa: F401
 
 settings = get_settings()
 

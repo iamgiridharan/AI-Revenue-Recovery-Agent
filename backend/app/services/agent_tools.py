@@ -151,17 +151,18 @@ def create_payment_link(
 ) -> dict:
     """
     Create a payment link for retry.
-    
-    NOTE: This is a MOCK implementation for Phase 4.
-    In Phase 5, this will connect to Razorpay Test Mode.
-    
-    The agent recommends this action, but execution goes through
-    the Policy Engine (next phase) before actual API call.
+
+    NOTE: this agent-side tool is a placeholder and returns no real link. Actual
+    payment-link execution goes through the Policy Engine first, in
+    ``app.services.recovery_service.execute_recovery_action``, which calls
+    Razorpay Test Mode (or returns a clearly labelled mock when no Test Mode
+    credentials are configured).
     """
     logger.info(f"MOCK: Creating payment link for case {case_id}, amount {amount} {currency}")
     
-    # Mock response - in production this would call Razorpay
-    mock_link = f"https://rzp.io/test/pay/{case_id[:8]}"
+    # Mock response - in production this would call Razorpay.  The .invalid TLD
+    # keeps a placeholder link from looking like a real payment link.
+    mock_link = f"https://mock.invalid/recovery/{case_id[:8]}"
     
     return {
         "success": True,

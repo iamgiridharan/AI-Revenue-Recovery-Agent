@@ -5,6 +5,7 @@ from app.models.recovery_action import RecoveryAction
 from app.models.audit_event import AuditEvent
 from app.models.policy_config import PolicyConfig
 from app.models.policy_decision import PolicyDecision
+from app.models.webhook_event import WebhookEvent
 from app.models.enums import (
     CaseStatus,
     CasePriority,
@@ -23,6 +24,7 @@ __all__ = [
     "AuditEvent",
     "PolicyConfig",
     "PolicyDecision",
+    "WebhookEvent",
     "CaseStatus",
     "CasePriority",
     "TransactionStatus",

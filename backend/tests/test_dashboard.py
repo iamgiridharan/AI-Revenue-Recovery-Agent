@@ -109,7 +109,7 @@ def policy(db_session):
     p = PolicyConfig(max_retries=2, max_reminders=2, max_recovery_attempts=3,
                      autonomous_amount_limit=10000.0, minimum_ai_confidence=0.3,
                      minimum_recovery_probability=0.2, case_lifetime_days=7,
-                     escalation_threshold=0.7, is_active=True)
+                     is_active=True)
     db_session.add(p)
     db_session.commit()
     db_session.refresh(p)

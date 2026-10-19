@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getCaseFullDetail } from '../services/api';
+import { getCaseFullDetail, executeRecovery } from '../services/api';
 
 const STATUS_STYLES = {
   OPEN: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -21,6 +21,106 @@ const TIMELINE_STEPS = [
   { key: 'ACTION_EXECUTED', label: 'Action Executed', icon: 'A' },
   { key: 'PAYMENT_RECEIVED', label: 'Payment Result', icon: '$' },
 ];
+
+// A case the autonomous flow must not act on again.
+const SETTLED_STATUSES = new Set(['RECOVERED', 'CLOSED']);
+
+/**
+ * Execute the case's recorded AI recommendation.
+ *
+ * The backend authorizes the action with the Policy Engine and creates a Razorpay
+ * Test Mode payment link. When no credentials are configured it returns
+ * `execution_mode: "MOCK"`, which means no provider call was made and the link
+ * cannot be paid - that is shown explicitly rather than as a payment.
+ */
+function RecoveryExecution({ caseId, status, onExecuted }) {
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const settled = SETTLED_STATUSES.has(status);
+
+  async function handleExecute() {
+    setRunning(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await executeRecovery(caseId, {});
+      setResult(res.data);
+      if (onExecuted) onExecuted();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <Section title="Execute Recovery Action (Razorpay Test Mode)">
+      <p className="text-sm text-gray-500 mb-3">
+        Executes this case&apos;s recorded AI recommendation. The Policy Engine must
+        approve it before any payment link is created, and the amount always comes
+        from the failed transaction record.
+      </p>
+
+      <button
+        onClick={handleExecute}
+        disabled={running || settled}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-40 flex items-center gap-2"
+      >
+        {running && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />}
+        {settled ? 'Case already settled' : 'Execute recovery action'}
+      </button>
+
+      {error && (
+        <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+          <p className="text-xs font-semibold text-red-700 mb-0.5">Action not executed</p>
+          <p className="text-sm text-red-800">{error}</p>
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-3 border border-gray-200 rounded-lg p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className={`text-[10px] font-bold tracking-wide px-2 py-0.5 rounded border ${
+              result.mock
+                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                : 'bg-blue-50 text-blue-700 border-blue-200'
+            }`}>
+              {result.execution_mode}
+            </span>
+            <span className="text-xs text-gray-500">
+              {result.mock
+                ? 'No Razorpay call was made. This is a placeholder link: no payment can be made through it.'
+                : 'Real Razorpay Test Mode payment link. Test cards only - no live money moves.'}
+            </span>
+          </div>
+
+          <InfoRow label="Action" value={result.action_type?.replace(/_/g, ' ')} />
+          <InfoRow label="Amount" value={formatCurrency(result.amount)} />
+          <InfoRow label="Payment Link ID" value={result.payment_link_id} />
+          <InfoRow label="Provider Status" value={result.provider_status} />
+
+          {result.payment_link && (
+            <a
+              href={result.payment_link}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-block text-sm text-blue-600 hover:text-blue-800 underline break-all"
+            >
+              {result.payment_link}
+            </a>
+          )}
+
+          <p className="text-[11px] text-gray-400">
+            The case is marked RECOVERED only by a verified payment webhook whose
+            captured amount matches the amount due.
+          </p>
+        </div>
+      )}
+    </Section>
+  );
+}
 
 function formatCurrency(amount) {
   if (amount === null || amount === undefined) return '-';
@@ -277,23 +377,24 @@ export default function CaseDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  useEffect(() => {
-    async function fetchDetail() {
-      try {
-        const res = await getCaseFullDetail(id);
-        if (res.success) {
-          setData(res.data);
-        } else {
-          setError(res.error?.message || 'Case not found');
-        }
-      } catch (err) {
-        setError(err.message);
-      } finally {
-        setLoading(false);
+  const fetchDetail = useCallback(async () => {
+    try {
+      const res = await getCaseFullDetail(id);
+      if (res.success) {
+        setData(res.data);
+      } else {
+        setError(res.error?.message || 'Case not found');
       }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
-    fetchDetail();
   }, [id]);
+
+  useEffect(() => {
+    fetchDetail();
+  }, [fetchDetail]);
 
   if (loading) {
     return (
@@ -365,6 +466,13 @@ export default function CaseDetail() {
 
           {/* Estimated recovery value (estimates only) */}
           <ValueAssessment assessment={valueAssessment} />
+
+          {/* Controlled recovery execution (Phase 4) */}
+          <RecoveryExecution
+            caseId={caseData.case_id}
+            status={caseData.status}
+            onExecuted={fetchDetail}
+          />
 
           {/* Diagnosis */}
           {caseData.diagnosis && (

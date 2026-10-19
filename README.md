@@ -4,7 +4,7 @@ An AI-powered system that detects failed payments, predicts recovery probability
 
 **Status:** MVP Complete — Recovery Pipeline Verified ✅  
 **Payment Integration:** Razorpay Test Mode ONLY  
-**Latest Verification:** 303 automated tests passing, simulated recovery outcomes confirmed
+**Latest Verification:** 390 automated tests passing; simulated recovery outcomes and the controlled Test Mode recovery flow (locally executed against a stub provider) confirmed
 
 ---
 
@@ -297,7 +297,6 @@ The Policy Engine validates every AI recommendation before execution.
 | MINIMUM_AI_CONFIDENCE | 0.3 | Minimum confidence required |
 | MINIMUM_RECOVERY_PROBABILITY | 0.2 | Minimum recovery probability |
 | CASE_LIFETIME_DAYS | 7 | Maximum case age before expiry |
-| ESCALATION_THRESHOLD | 0.7 | Confidence above which escalation triggers |
 
 ### Policy Validation
 
@@ -305,7 +304,6 @@ The system includes sanity validation to prevent configurations that would make 
 - `autonomous_amount_limit` must be ≥ 100
 - `minimum_ai_confidence` must be ≤ 0.95
 - `minimum_recovery_probability` must be ≤ 0.95
-- `escalation_threshold` must be ≤ 0.95
 
 Invalid configurations are **rejected by the API** (`PUT /api/policies` returns a validation
 error). Runtime reads never rewrite a stored policy: values outside these ranges are logged
@@ -316,9 +314,12 @@ low autonomous amount limit) are preserved.
 
 - **APPROVED:** All checks passed, action allowed
 - **BLOCKED:** Critical check failed, action prevented
-- **ESCALATED:** Threshold exceeded, human review required. The case is moved to the
-  `ESCALATED` status and a `CASE_ESCALATED` audit event is recorded, so escalations are
-  visible to the dashboard and to operators.
+- **ESCALATED:** A configured limit was exceeded (amount, AI confidence or recovery
+  probability) and human review is required. The case is moved to the `ESCALATED` status
+  and a `CASE_ESCALATED` audit event is recorded, so escalations are visible to the
+  dashboard and to operators. Escalation is driven by those limits alone — there is no
+  separate escalation threshold setting; a low `minimum_ai_confidence` never forces
+  escalation, it only stops the autonomous flow at the point it would otherwise act.
 
 ---
 
@@ -396,11 +397,104 @@ Value scoring **ranks eligible candidate actions and never authorizes or execute
 
 > **Note:** Without Razorpay Test Mode credentials configured, the system operates in mock/simulated mode. No real payment links are created. The simulation pipeline demonstrates recovery outcomes without requiring Razorpay credentials.
 
+### Controlled Recovery Execution
+
+`POST /api/cases/{case_id}/recovery` executes a case's **recorded AI recommendation**
+and, for `CREATE_PAYMENT_LINK` / `RETRY`, creates the payment link. The request body
+only selects the action (`{"action_type": "RETRY", "reason": "..."}`, both optional):
+
+- The **amount** always comes from the database transaction record, and the
+  **confidence / recovery probability** always come from the recorded diagnosis.
+  A caller cannot supply either, so it cannot step over `MINIMUM_AI_CONFIDENCE` or
+  choose what will be charged.
+- The **Policy Engine authorizes the action before any provider call**. A `BLOCKED` or
+  `ESCALATED` decision returns **403** (with the full decision) and creates nothing.
+  `RECOVERED` / `CLOSED` cases return **409** — a settled case is never acted on again.
+- The link carries the case on **both** `reference_id` and `notes.case_id`, so a webhook
+  can always be traced back to the right case.
+- The response and the audit trail state how the link was created:
+  `execution_mode: "RAZORPAY_TEST_MODE"` (a real Test Mode object) or
+  `execution_mode: "MOCK"` (no provider call was made and the placeholder link —
+  `https://mock.invalid/...` — cannot be paid). Mock execution is never labelled or
+  recorded as a payment.
+- No secrets are returned; the API returns only the link, its id, amount, mode,
+  provider status and the policy decision.
+
+The case is only marked `RECOVERED` by a verified payment webhook.
+
 ### Webhook Events Handled
 
-- `payment.authorized` / `payment.captured` / `payment_link.paid` → Success
-- `payment.failed` / `payment_link.expired` → Failure
+- `payment.captured` / `payment_link.paid` → **settles** the case (status `RECOVERED`,
+  `recovered_amount` booked) — only when the captured amount equals the amount due
+- `payment.failed` / `payment_link.expired` → failure: the case is reopened for the next
+  attempt, unless it is already settled (then the event is recorded and ignored)
+- `payment.authorized` → recorded, **not** settled: an authorization is not a capture,
+  so it must not book revenue that may never arrive
 - Unknown events → Logged and acknowledged
+
+### Webhook Safety
+
+- **Signature:** HMAC-SHA256 over the raw body, compared with the raw body, failing
+  closed. With no `RAZORPAY_WEBHOOK_SECRET` configured every delivery is rejected (401)
+  rather than trusted.
+- **Idempotency (durable):** every handled delivery is recorded by its provider event id
+  in the `webhook_events` table. A redelivery — also after a restart or on another
+  worker, where an in-memory cache would forget — is answered as a duplicate and applies
+  nothing twice, so recovered revenue is never double-counted.
+- **Ordering:** a delivery is recorded only *after* it has been handled, so a failed
+  delivery stays retryable; late or duplicate events for a settled case are recorded and
+  ignored instead of reopening or corrupting it.
+- **Amount:** a capture that is non-positive or different from the amount due is refused
+  with a `PAYMENT_SUCCESS_AMOUNT_UNVERIFIED` / `PAYMENT_SUCCESS_AMOUNT_MISMATCH` audit
+  event, and the case is left for manual reconciliation.
+
+### Configuring Razorpay Test Mode
+
+Credentials are read from `backend/.env` (already ignored by Git — see `.gitignore`);
+never commit them and never paste them into the frontend.
+
+| Variable | Where it comes from |
+|----------|---------------------|
+| `RAZORPAY_KEY_ID` | Razorpay Dashboard → Account & Settings → **API Keys** → *Generate Test Key* (Test Mode toggle on). Starts with `rzp_test_` |
+| `RAZORPAY_KEY_SECRET` | Shown once, next to the Test Key ID. Copy it immediately |
+| `RAZORPAY_WEBHOOK_SECRET` | Razorpay Dashboard → Account & Settings → **Webhooks** → *Add New Webhook*: URL = `https://<your-public-host>/api/webhooks/razorpay`, secret = a value you choose. Subscribe to `payment.captured`, `payment_link.paid`, `payment.failed`, `payment_link.expired` |
+
+Razorpay only delivers webhooks to a public HTTPS URL. For a demonstration either
+
+- deploy the backend (Render is already configured in `render.yaml`) and point the
+  webhook at `https://<service>.onrender.com/api/webhooks/razorpay`, or
+- expose the local API through an HTTPS tunnel, e.g.
+  `ngrok http 8000` and use the `https://<id>.ngrok-free.app/api/webhooks/razorpay`
+  URL it prints. The tunnel URL changes when it restarts, so update the webhook URL
+  in the dashboard when it does.
+
+### One Test Mode Payment, End to End
+
+1. Put the three values above in `backend/.env`, then restart the backend so the
+   settings are re-read.
+2. Confirm they are loaded: `GET /api/health` (and check the startup log line
+   `Razorpay client initialized successfully (Test Mode)`).
+3. Start the public endpoint (deploy, or `ngrok http 8000`) and set that URL as the
+   webhook in the Razorpay dashboard, with the same secret as
+   `RAZORPAY_WEBHOOK_SECRET`.
+4. Create or pick a case and diagnose it: `POST /api/agent/diagnose` with
+   `{"case_id": "<CASE-ID>"}` (or open the case page and use *Execute recovery
+   action*).
+5. Execute the recommendation: `POST /api/cases/<CASE-ID>/recovery` with `{}`, or the
+   button on the case detail page. The response must say
+   `"execution_mode": "RAZORPAY_TEST_MODE"`; if it says `MOCK`, the credentials are not
+   being picked up and no real link exists.
+6. Open the returned `payment_link` and pay with a Razorpay **test instrument** (for
+   example a test card, or UPI `success@razorpay`). No real money moves.
+7. Watch the case: within a few seconds the webhook settles it — status `RECOVERED`,
+   `recovered_amount` equal to the case amount, a `PAYMENT_SUCCESS` audit event from
+   actor `webhook`, and one `webhook_events` row for the delivery.
+8. Verify the single booking: re-send the same webhook (Razorpay's *Resend* button, or
+   replay the delivery) and confirm the response says `Duplicate event ignored` and the
+   case's `recovered_amount` is unchanged.
+
+Until steps 1–3 are done the flow can only be exercised in `MOCK` mode (or by
+simulating a signed delivery locally); the real provider round trip is unverified.
 
 ---
 
@@ -684,8 +778,11 @@ python -m pytest tests/ -v
 - ✅ Razorpay Test Mode only (never Live Mode)
 - ✅ Razorpay secret keys only on backend
 - ✅ Webhook signature verification enabled (fails closed: unsigned webhooks are rejected with 401)
-- ✅ Duplicate webhook protection
+- ✅ Duplicate webhook protection (durable: recorded in the database, survives restarts)
+- ✅ Only captured payments with the exact amount due settle a case
 - ✅ Policy limits enforced on all actions
+- ✅ Recovery execution requires a recorded AI diagnosis and policy authorization
+- ✅ Mock executions are labelled MOCK and never presented as a payment
 - ✅ LLM cannot bypass Policy Engine
 - ✅ Amounts come from trusted database, not LLM
 - ✅ Frontend cannot execute payment operations
@@ -697,8 +794,14 @@ python -m pytest tests/ -v
 ## Limitations
 
 1. **LLM is mocked** — Uses deterministic rules instead of real LLM API
-2. **Payment links are simulated** — No actual Razorpay payment links created without credentials
-3. **No real webhook processing** — Requires Razorpay Test Mode account for real webhooks
+2. **No real provider round trip has been executed yet** — the controlled recovery flow
+   and webhook handling are implemented and verified with a stubbed provider (and a
+   locally signed webhook); creating a real Test Mode payment link and receiving a real
+   Razorpay webhook delivery requires Test Mode credentials and a public HTTPS URL
+3. **Recovery execution has no authentication** — consistent with the rest of this MVP
+   (single tenant, no user accounts), but `POST /api/cases/{case_id}/recovery` is a
+   mutation endpoint: in a deployed demonstration it should sit behind authentication,
+   and it must never run with Live Mode credentials
 4. **Single-tenant** — No merchant authentication/authorization
 5. **No real-time updates** — Dashboard requires manual refresh
 6. **SQLite for tests** — Production uses PostgreSQL
@@ -711,8 +814,8 @@ python -m pytest tests/ -v
 ## Future Improvements
 
 1. Real LLM integration (OpenAI/Anthropic)
-2. Real Razorpay Test Mode payment links
-3. Webhook endpoint for live payment updates
+2. A verified real Razorpay Test Mode round trip (credentials + public webhook URL)
+3. Authentication/authorization on mutating endpoints (diagnose, execute recovery)
 4. Multi-merchant support with authentication
 5. Real-time WebSocket updates
 6. Email/SMS notifications

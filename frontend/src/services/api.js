@@ -56,6 +56,12 @@ export const getCases = (params = {}) => {
 export const getCaseDetail = (caseId) => api.get(`/cases/${caseId}`);
 export const getCaseFullDetail = (caseId) => api.get(`/cases/${caseId}/detail`);
 
+// Execute the case's recorded AI recommendation. The backend authorizes it with
+// the Policy Engine and creates a Razorpay Test Mode payment link (or a clearly
+// labelled mock when no credentials are configured).
+export const executeRecovery = (caseId, data = {}) =>
+  api.post(`/cases/${caseId}/recovery`, data);
+
 // ============================================================================
 // Audit
 // ============================================================================

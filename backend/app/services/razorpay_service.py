@@ -61,6 +61,7 @@ def create_payment_link(
     customer_phone: Optional[str] = None,
     reference_id: Optional[str] = None,
     expiry_days: int = 1,
+    notes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a Razorpay Payment Link.
@@ -73,6 +74,9 @@ def create_payment_link(
         customer_phone: Customer phone number
         reference_id: Unique reference ID for the payment
         expiry_days: Number of days until link expires
+        notes: Key/value metadata copied onto the link.  Reaches the payment and
+            therefore the webhook, which is how a delivery is associated with
+            the right revenue risk case.
         
     Returns:
         Dictionary containing payment link details
@@ -104,6 +108,9 @@ def create_payment_link(
             "callback_url": f"{settings.CORS_ORIGINS[0]}/payment/callback" if settings.CORS_ORIGINS else None,
             "callback_method": "get",
         }
+
+        if notes:
+            payload["notes"] = notes
         
         # Add customer details if provided
         if customer_email or customer_phone:
@@ -128,7 +135,10 @@ def create_payment_link(
             "status": response.get("status"),
             "created_at": response.get("created_at"),
             "expires_at": response.get("expires_by"),
-            "raw_response": response,
+            # Test Mode credentials were used for this call: the link is a real
+            # Razorpay object, but no live money can move through it.
+            "provider": "razorpay_test_mode",
+            "mock": False,
         }
         
     except Exception as e:
@@ -157,13 +167,18 @@ def _create_mock_payment_link(
     return {
         "success": True,
         "payment_link_id": mock_id,
-        "payment_link": f"https://rzp.io/test/{mock_id}",
+        # Deliberately not an rzp.io URL: a mock link must be impossible to mistake
+        # for a real Razorpay payment link (the .invalid TLD can never resolve).
+        "payment_link": f"https://mock.invalid/recovery/{mock_id}",
         "amount": amount,
         "currency": currency,
         "reference_id": mock_ref,
         "status": "created",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": None,
+        # No provider call was made: this link is a local placeholder, not a
+        # Razorpay payment link, and it must never be presented as one.
+        "provider": "mock",
         "mock": True,
     }
 

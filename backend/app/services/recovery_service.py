@@ -20,6 +20,7 @@ from app.models import (
     RevenueRiskCase,
     RecoveryAction,
     Transaction,
+    Customer,
     AuditEvent,
     CaseStatus,
     AuditEventType,
@@ -60,6 +61,7 @@ def execute_recovery_action(
     if not case:
         return {
             "success": False,
+            "code": "CASE_NOT_FOUND",
             "error": f"Case {case_id} not found",
             "action_executed": False,
         }
@@ -69,6 +71,7 @@ def execute_recovery_action(
     if not transaction:
         return {
             "success": False,
+            "code": "TRANSACTION_NOT_FOUND",
             "error": f"Transaction not found for case {case_id}",
             "action_executed": False,
         }
@@ -77,6 +80,7 @@ def execute_recovery_action(
     if case.status == CaseStatus.RECOVERED.value:
         return {
             "success": False,
+            "code": "CASE_ALREADY_RECOVERED",
             "error": f"Case {case_id} is already recovered",
             "action_executed": False,
         }
@@ -84,6 +88,7 @@ def execute_recovery_action(
     if case.status == CaseStatus.CLOSED.value:
         return {
             "success": False,
+            "code": "CASE_CLOSED",
             "error": f"Case {case_id} is closed",
             "action_executed": False,
         }
@@ -140,6 +145,7 @@ def execute_recovery_action(
         
         return {
             "success": False,
+            "code": "POLICY_ESCALATED" if escalated else "POLICY_BLOCKED",
             "error": (f"Policy escalated: {policy_result.reason}" if escalated
                       else f"Policy blocked: {policy_result.reason}"),
             "action_executed": False,
@@ -177,6 +183,7 @@ def execute_recovery_action(
         else:
             result = {
                 "success": False,
+                "code": "UNSUPPORTED_ACTION",
                 "error": f"Unsupported action type: {action_type}",
                 "action_executed": False,
             }
@@ -214,9 +221,58 @@ def execute_recovery_action(
         
         return {
             "success": False,
+            "code": "EXECUTION_FAILED",
             "error": str(e),
             "action_executed": False,
         }
+
+
+def get_recorded_diagnosis(db: Session, case: RevenueRiskCase) -> Optional[Dict[str, Any]]:
+    """
+    Return the AI diagnosis recorded for a case, if there is one.
+
+    Recovery execution re-uses the recorded recommendation and its recorded
+    confidence and recovery probability instead of accepting them from the
+    caller: a caller that could supply its own confidence would walk straight
+    past MINIMUM_AI_CONFIDENCE (and could book an action nobody approved).
+
+    Returns:
+        ``{"action_type", "confidence", "recovery_probability"}`` or None when
+        the case has no completed diagnosis.
+    """
+    event = (
+        db.query(AuditEvent)
+        .filter(
+            AuditEvent.case_id == case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+            AuditEvent.actor == "ai_agent",
+            AuditEvent.confidence.isnot(None),
+        )
+        .order_by(AuditEvent.timestamp.desc(), AuditEvent.id.desc())
+        .first()
+    )
+    if event is None:
+        return None
+
+    metadata = event.metadata_ or {}
+    probability = metadata.get("recovery_probability")
+    if probability is None:
+        probability = case.recovery_probability
+
+    return {
+        "action_type": event.action or case.recommended_action,
+        "confidence": event.confidence,
+        # A missing probability is reported as 0.0, which fails
+        # MINIMUM_RECOVERY_PROBABILITY and therefore escalates rather than
+        # silently authorizing an action on unknown evidence.
+        "recovery_probability": probability if probability is not None else 0.0,
+    }
+
+
+def case_customer_email(db: Session, case: RevenueRiskCase) -> Optional[str]:
+    """Return the case customer's email, for the payment link's customer block."""
+    customer = db.query(Customer).filter(Customer.id == case.customer_id).first()
+    return customer.email if customer else None
 
 
 def _execute_create_payment_link(
@@ -239,24 +295,29 @@ def _execute_create_payment_link(
             the MAX_RETRIES policy rule can see it.
     """
     logger.info(f"Creating payment link for case {case.case_id}")
-    
-    # Get customer email/phone if available
-    customer_email = None
-    customer_phone = None
-    
-    # Create payment link via Razorpay
+
+    # Create payment link via Razorpay (Test Mode credentials only).
+    # The amount always comes from the trusted database transaction record, never
+    # from the LLM or the caller, and the case is carried on both the link's
+    # reference_id and its notes so a webhook can always be traced back to it.
     payment_link_result = create_payment_link(
         amount=transaction.amount,  # Amount from database, NOT from LLM
         currency=transaction.currency or "INR",
         description=f"Recovery payment for case {case.case_id}",
-        customer_email=customer_email,
-        customer_phone=customer_phone,
+        customer_email=case_customer_email(db, case),
+        customer_phone=None,
         reference_id=case.case_id,
         expiry_days=1,
+        notes={"reference_id": case.case_id, "case_id": case.case_id},
     )
     
     if not payment_link_result.get("success"):
         raise Exception(f"Failed to create payment link: {payment_link_result.get('error')}")
+
+    # Make the distinction explicit everywhere this execution is recorded: a mock
+    # link is not a payment and must never be reported as one.
+    is_mock = bool(payment_link_result.get("mock", False))
+    execution_mode = "MOCK" if is_mock else "RAZORPAY_TEST_MODE"
     
     # Create recovery action record
     recovery_action = RecoveryAction(
@@ -281,7 +342,10 @@ def _execute_create_payment_link(
         event_type=AuditEventType.ACTION_EXECUTED.value,
         actor="recovery_service",
         decision="APPROVED",
-        reason=f"Payment link created: {payment_link_result.get('payment_link')}",
+        reason=(f"Payment link created: {payment_link_result.get('payment_link')}"
+                if not is_mock else
+                f"MOCK payment link created (no provider call): "
+                f"{payment_link_result.get('payment_link')}"),
         confidence=confidence,
         action=recorded_action_type,
         result="SUCCESS",
@@ -289,14 +353,24 @@ def _execute_create_payment_link(
             "payment_link_id": payment_link_result.get("payment_link_id"),
             "payment_link": payment_link_result.get("payment_link"),
             "amount": transaction.amount,
-            "mock": payment_link_result.get("mock", False),
+            "currency": transaction.currency,
+            "case_reference": case.case_id,
+            "provider": payment_link_result.get("provider", "razorpay"),
+            "provider_status": payment_link_result.get("status"),
+            "expires_at": payment_link_result.get("expires_at"),
+            "execution_mode": execution_mode,
+            "mock": is_mock,
+            "settled_by": "payment_webhook",
         },
     )
     db.add(audit_event)
     
     db.commit()
     
-    logger.info(f"Payment link created for case {case.case_id}: {payment_link_result.get('payment_link')}")
+    logger.info(
+        f"Payment link created for case {case.case_id} "
+        f"[{execution_mode}]: {payment_link_result.get('payment_link')}"
+    )
     
     return {
         "success": True,
@@ -305,7 +379,13 @@ def _execute_create_payment_link(
         "payment_link": payment_link_result.get("payment_link"),
         "amount": transaction.amount,
         "currency": transaction.currency,
-        "mock": payment_link_result.get("mock", False),
+        # ``execution_mode`` MOCK means no provider call was made: the link is a
+        # placeholder and no payment can be made through it.
+        "execution_mode": execution_mode,
+        "mock": is_mock,
+        "provider_status": payment_link_result.get("status"),
+        "expires_at": payment_link_result.get("expires_at"),
+        "case_reference": case.case_id,
     }
 
 
