@@ -888,3 +888,165 @@ class TestPolicyAPI:
         )
         
         assert response.status_code == 400
+
+
+# ============================================================================
+# TERMINAL-STATE AND HUMAN-REVIEW GATES
+# ============================================================================
+
+
+def _make_case(db_session, customer, transaction, case_id, status):
+    """Create a case in a specific status for gate testing."""
+    case = RevenueRiskCase(
+        case_id=case_id,
+        transaction_id=transaction.id,
+        customer_id=customer.id,
+        amount=2500.0,
+        risk_score=0.75,
+        recovery_probability=0.65,
+        priority="HIGH",
+        status=status,
+        attempt_count=0,
+        recovered_amount=0.0,
+    )
+    db_session.add(case)
+    db_session.commit()
+    return case
+
+
+class TestTerminalAndHumanReviewGates:
+    """
+    The policy engine is the final authorization authority, so it must refuse
+    settled and human-review cases itself instead of depending on every caller
+    to re-implement those guards.
+
+    Regression tests for two confirmed gaps:
+      1. a CLOSED (terminal) case was APPROVED by the engine, and
+      2. an ESCALATED case (human review required) was APPROVED and executed by
+         a later high-confidence call, bypassing the approval requirement.
+    """
+
+    def test_closed_case_is_blocked(self, db_session, sample_customer, sample_transaction):
+        """A closed case must never be authorized."""
+        _make_case(db_session, sample_customer, sample_transaction,
+                   "CASE-CLOSED", CaseStatus.CLOSED.value)
+
+        result = evaluate_action(
+            db=db_session,
+            case_id="CASE-CLOSED",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.9,
+            recovery_probability=0.8,
+        )
+
+        assert result.allowed is False
+        assert result.decision == "BLOCKED"
+        assert any(check.rule == "CASE_NOT_CLOSED" and not check.passed
+                   for check in result.checks)
+
+    def test_closed_case_is_not_executed(self, db_session, sample_customer, sample_transaction):
+        """A closed case must not be executed and its terminal status must hold."""
+        from app.services.recovery_service import execute_recovery_action
+
+        case = _make_case(db_session, sample_customer, sample_transaction,
+                          "CASE-CLOSED", CaseStatus.CLOSED.value)
+
+        result = execute_recovery_action(
+            db=db_session,
+            case_id="CASE-CLOSED",
+            action_type=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.9,
+            recovery_probability=0.8,
+        )
+
+        assert result["success"] is False
+        assert result["action_executed"] is False
+        assert "payment_link_id" not in result
+
+        db_session.refresh(case)
+        assert case.status == CaseStatus.CLOSED.value
+        assert case.attempt_count == 0
+
+    def test_escalated_case_is_blocked_pending_human_review(
+        self, db_session, sample_customer, sample_transaction
+    ):
+        """An escalated case must not be authorized while review is pending."""
+        _make_case(db_session, sample_customer, sample_transaction,
+                   "CASE-ESCALATED", CaseStatus.ESCALATED.value)
+
+        result = evaluate_action(
+            db=db_session,
+            case_id="CASE-ESCALATED",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.95,
+            recovery_probability=0.9,
+        )
+
+        assert result.allowed is False
+        assert result.decision == "BLOCKED"
+        assert any(check.rule == "HUMAN_REVIEW_REQUIRED" and not check.passed
+                   for check in result.checks)
+
+    def test_escalated_case_is_not_autonomously_resumed(
+        self, db_session, sample_customer, sample_transaction
+    ):
+        """
+        Regression test: escalating a case for human review used to be
+        reversible by the autonomous flow itself - a second call with high
+        confidence was approved, created a payment link and consumed an
+        attempt on a case that was waiting for a human.
+        """
+        from app.models import AuditEvent
+        from app.services.recovery_service import execute_recovery_action
+
+        case = _make_case(db_session, sample_customer, sample_transaction,
+                          "CASE-ESCALATE-THEN-RETRY", CaseStatus.OPEN.value)
+
+        # First call: confidence below the minimum, so the case is escalated.
+        first = execute_recovery_action(
+            db=db_session,
+            case_id="CASE-ESCALATE-THEN-RETRY",
+            action_type=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.1,
+            recovery_probability=0.05,
+        )
+        assert first["success"] is False
+        assert first["escalated"] is True
+        db_session.refresh(case)
+        assert case.status == CaseStatus.ESCALATED.value
+
+        # Second call: everything looks good, but the case is pending review.
+        second = execute_recovery_action(
+            db=db_session,
+            case_id="CASE-ESCALATE-THEN-RETRY",
+            action_type=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.95,
+            recovery_probability=0.9,
+        )
+
+        assert second["success"] is False
+        assert second["action_executed"] is False
+        assert "payment_link_id" not in second
+        assert "human review" in second["error"]
+
+        db_session.refresh(case)
+        assert case.status == CaseStatus.ESCALATED.value
+        assert case.attempt_count == 0
+
+        # The recovery service records the block and its reason in the audit trail.
+        blocked = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == case.id,
+            AuditEvent.actor == "recovery_service",
+            AuditEvent.result == "BLOCKED_BY_POLICY",
+        ).first()
+        assert blocked is not None
+        assert blocked.event_type == AuditEventType.ACTION_FAILED.value
+        assert "awaiting human review" in blocked.reason
+        assert blocked.action == RecoveryActionEnum.CREATE_PAYMENT_LINK.value
+
+        blocked_action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == case.id,
+            RecoveryAction.execution_status == "BLOCKED_BY_POLICY",
+        ).first()
+        assert blocked_action is not None
+        assert blocked_action.policy_result == "BLOCKED"

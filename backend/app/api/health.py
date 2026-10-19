@@ -19,15 +19,15 @@ def health_check():
     # Check database if configured
     if settings.DATABASE_URL:
         try:
-            from app.core.database import get_db as _get_db
-            from sqlalchemy.orm import Session
-            from app.core.database import init_database, engine
-            from app.core.database import SessionLocal as _SessionLocal
+            # Import the module, not the names: ``engine``/``SessionLocal`` are
+            # created lazily by ``init_database()``, so a by-value import would
+            # keep the pre-initialisation ``None`` binding.
+            from app.core import database as database_module
 
-            if engine is None:
-                init_database()
+            if database_module.engine is None:
+                database_module.init_database()
 
-            db = _SessionLocal()
+            db = database_module.SessionLocal()
             try:
                 db.execute(text("SELECT 1"))
                 db_status = "connected"

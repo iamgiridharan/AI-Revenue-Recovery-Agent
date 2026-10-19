@@ -256,6 +256,47 @@ def check_payment_success(case: RevenueRiskCase) -> PolicyCheck:
     )
 
 
+def check_case_not_closed(case: RevenueRiskCase) -> PolicyCheck:
+    """
+    Check that the case has not been settled by closing it.
+
+    CLOSED is a terminal state (the case is settled outside the autonomous
+    flow), so the policy engine - the final authorization authority - must
+    refuse to authorize anything for it.  Callers such as the recovery service
+    check this too, but a duplicated caller-side guard is not a substitute for
+    the authority refusing.
+    """
+    passed = case.status != CaseStatus.CLOSED.value
+
+    return PolicyCheck(
+        rule="CASE_NOT_CLOSED",
+        passed=passed,
+        reason=None if passed else "Case is closed; no further recovery action may be authorized",
+        value=1.0 if not passed else 0.0,
+        limit=0.0,
+    )
+
+
+def check_human_review_required(case: RevenueRiskCase) -> PolicyCheck:
+    """
+    Check that no human decision is pending for the case.
+
+    An ESCALATED case is waiting for human review.  Allowing the autonomous
+    flow to authorize (and therefore execute) further actions on it would
+    silently bypass the approval requirement that escalation exists to
+    enforce.
+    """
+    passed = case.status != CaseStatus.ESCALATED.value
+
+    return PolicyCheck(
+        rule="HUMAN_REVIEW_REQUIRED",
+        passed=passed,
+        reason=None if passed else "Case is escalated and awaiting human review",
+        value=1.0 if not passed else 0.0,
+        limit=0.0,
+    )
+
+
 def check_escalation_threshold(confidence: float, policy: PolicyConfig) -> PolicyCheck:
     """Check if confidence is above escalation threshold."""
     # This check is informational - if confidence is above threshold,
@@ -325,6 +366,21 @@ def evaluate_action(
         return _create_decision(db, case, proposed_action, "BLOCKED", 
                                "Payment already successful", checks, confidence, recovery_probability, persist=persist)
     
+    # Check that the case is not settled (terminal CLOSED state)
+    check = check_case_not_closed(case)
+    checks.append(check)
+    if not check.passed:
+        return _create_decision(db, case, proposed_action, "BLOCKED",
+                               "Case is closed", checks, confidence, recovery_probability, persist=persist)
+
+    # Check that no human decision is pending (ESCALATED cases are not autonomous)
+    check = check_human_review_required(case)
+    checks.append(check)
+    if not check.passed:
+        return _create_decision(db, case, proposed_action, "BLOCKED",
+                               "Case is escalated and awaiting human review", checks,
+                               confidence, recovery_probability, persist=persist)
+
     # Check case expiry
     check = check_case_expiry(case, policy)
     checks.append(check)

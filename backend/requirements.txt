@@ -9,3 +9,13 @@ alembic>=1.13.0
 pytest>=8.3.0
 httpx>=0.27.0
 razorpay>=1.4.0
+
+# ML inference stack — imported at startup (app.api.ml -> app.services.ml_service
+# -> ml.predictor/ml.model), so the API cannot boot without these.
+# Pinned: ml/saved_models/*.joblib are pickles that must be loaded by the
+# scikit-learn version that produced them.
+numpy==2.5.2
+pandas==3.0.5
+scipy==1.18.1
+scikit-learn==1.9.0
+joblib==1.5.3

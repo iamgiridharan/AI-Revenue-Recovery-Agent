@@ -1247,3 +1247,174 @@ class TestWebhookSecurityAndIdempotency:
             AuditEvent.decision == "PAYMENT_SUCCESS_AMOUNT_MISMATCH",
         ).first()
         assert audit is not None
+
+
+class TestCapturedAmountVerification:
+    """
+    A success webhook only settles a case when it carries a positive amount that
+    matches the amount that was due.
+
+    Regression tests for two confirmed gaps:
+      1. a capture event with a missing/zero amount marked the case RECOVERED
+         with recovered_amount 0.0, and
+      2. a partial capture (e.g. 100 of 2500) settled the case, terminating
+         recovery on the remaining balance.
+    Both previously stopped all further recovery on an unpaid debt.
+    """
+
+    def test_non_positive_capture_does_not_settle_case(self, client, db_session, risk_case):
+        """A zero-amount capture must not mark the case recovered."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_zero_1", amount_paise=0)),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["rejected"] is True
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.recovered_amount == 0.0
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.decision == "PAYMENT_SUCCESS_AMOUNT_UNVERIFIED",
+        ).first()
+        assert audit is not None
+        assert audit.result == "REJECTED"
+
+        # The unverified event must not consume the case: a valid capture for the
+        # full amount still settles it.
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            retry = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_zero_2")),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert retry.json()["result"]["status"] == "RECOVERED"
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.RECOVERED.value
+        assert risk_case.recovered_amount == 2500.0
+
+    def test_partial_capture_requires_manual_reconciliation(self, client, db_session, risk_case):
+        """A capture for less than the case amount must not settle the case."""
+        import json
+        import app.api.webhooks as webhooks
+
+        webhooks._processed_events.clear()
+
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            response = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_partial_1", amount_paise=10000)),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert response.status_code == 200
+        result = response.json()["result"]
+        assert result["success"] is False
+        assert result["manual_reconciliation_required"] is True
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.recovered_amount == 0.0
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.decision == "PAYMENT_SUCCESS_AMOUNT_MISMATCH",
+        ).first()
+        assert audit is not None
+        assert audit.metadata_["amount"] == 100.0
+        assert audit.metadata_["case_amount"] == 2500.0
+
+        # Recovery on the outstanding balance is still possible.
+        with patch("app.api.webhooks.verify_webhook_signature", return_value=True):
+            retry = client.post(
+                "/api/webhooks/razorpay",
+                content=json.dumps(_captured_payload("pay_partial_2")),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Razorpay-Signature": "valid",
+                },
+            )
+
+        assert retry.json()["result"]["status"] == "RECOVERED"
+
+    def test_wrong_signature_changes_no_state(self, client, db_session, risk_case, monkeypatch):
+        """
+        With a webhook secret configured, a delivery signed with the wrong key
+        must change no payment or recovery state - and must not be recorded as
+        processed, so the provider's legitimate retry is still handled.
+        """
+        import hashlib
+        import hmac
+        import json
+
+        import app.api.webhooks as webhooks
+        import app.services.razorpay_service as razorpay_service
+
+        secret = "test_webhook_secret"
+        monkeypatch.setattr(
+            razorpay_service.settings, "RAZORPAY_WEBHOOK_SECRET", secret, raising=False
+        )
+        webhooks._processed_events.clear()
+
+        body = json.dumps(_captured_payload("pay_badsig_1"))
+        response = client.post(
+            "/api/webhooks/razorpay",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Razorpay-Signature": "0" * 64,
+                "X-Razorpay-Event-Id": "evt_badsig_1",
+            },
+        )
+
+        assert response.status_code == 401
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.recovered_amount == 0.0
+        assert db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id
+        ).count() == 0
+        assert "evt_badsig_1" not in webhooks._processed_events
+
+        # The same delivery, correctly signed, is still processed.
+        signature = hmac.new(
+            secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        accepted = client.post(
+            "/api/webhooks/razorpay",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Razorpay-Signature": signature,
+                "X-Razorpay-Event-Id": "evt_badsig_1",
+            },
+        )
+
+        assert accepted.status_code == 200
+        assert accepted.json()["result"]["status"] == "RECOVERED"
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.RECOVERED.value
+        assert risk_case.recovered_amount == 2500.0

@@ -479,6 +479,78 @@ def process_payment_success(
             "recovered_amount": recorded,
         }
     
+    # A success event must carry the amount that was actually captured.  A
+    # missing or non-positive amount cannot be a verified recovery, and settling
+    # the case for zero revenue would stop recovery on a debt that was never
+    # paid.
+    if amount is None or amount <= 0:
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="webhook",
+            decision="PAYMENT_SUCCESS_AMOUNT_UNVERIFIED",
+            reason=(f"Payment {payment_id} reported as captured with non-positive amount "
+                    f"{amount}; case {case_id} was not settled"),
+            action="PAYMENT_RECEIVED",
+            result="REJECTED",
+            metadata_={
+                "payment_id": payment_id,
+                "amount": amount,
+                "case_amount": case.amount,
+            },
+        ))
+        db.commit()
+        logger.error(
+            f"Payment success for case {case_id} rejected: amount {amount} is not positive"
+        )
+        return {
+            "success": False,
+            "rejected": True,
+            "manual_reconciliation_required": True,
+            "error": (f"Captured amount {amount} is not positive; case {case_id} left "
+                      f"open for manual reconciliation"),
+            "case_id": case_id,
+            "status": case.status,
+            "recovered_amount": case.recovered_amount,
+        }
+
+    # The captured amount has to match the amount that was due.  Recovery links
+    # are created for exactly case.amount, so a different amount means a partial
+    # capture or a payment from another source.  Settling the case would stop
+    # recovery on the remaining balance and misstate the recovered figure, so a
+    # human reconciles it instead (same stance as the settled-case guards above).
+    if abs(case.amount - amount) > 0.01:
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="webhook",
+            decision="PAYMENT_SUCCESS_AMOUNT_MISMATCH",
+            reason=(f"Payment {payment_id} captured {amount} but case {case_id} is for "
+                    f"{case.amount}; case was not settled and requires manual reconciliation"),
+            action="PAYMENT_RECEIVED",
+            result="MISMATCH",
+            metadata_={
+                "payment_id": payment_id,
+                "amount": amount,
+                "case_amount": case.amount,
+            },
+        ))
+        db.commit()
+        logger.error(
+            f"Captured amount {amount} does not match case {case_id} amount "
+            f"{case.amount}; manual reconciliation required"
+        )
+        return {
+            "success": False,
+            "rejected": True,
+            "manual_reconciliation_required": True,
+            "error": (f"Captured amount {amount} does not match case amount {case.amount} "
+                      f"for case {case_id}; manual reconciliation required"),
+            "case_id": case_id,
+            "status": case.status,
+            "recovered_amount": case.recovered_amount,
+        }
+
     # Update case
     case.status = CaseStatus.RECOVERED.value
     case.recovered_amount = amount
