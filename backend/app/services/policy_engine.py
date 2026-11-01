@@ -56,13 +56,14 @@ def _impossible_policy_values(policy: PolicyConfig) -> List[str]:
     the database.  They are reported, never rewritten.
     """
     impossible: List[str] = []
-    if policy.autonomous_amount_limit < 100:
+    if not 100 <= policy.autonomous_amount_limit <= 100000:
         impossible.append(f"autonomous_amount_limit={policy.autonomous_amount_limit}")
-    if policy.minimum_ai_confidence > 0.95:
+    # A threshold of exactly 1.0 is valid: it blocks every autonomous action.
+    if not 0.1 <= policy.minimum_ai_confidence <= 1.0:
         impossible.append(f"minimum_ai_confidence={policy.minimum_ai_confidence}")
-    if policy.minimum_recovery_probability > 0.95:
+    if not 0.05 <= policy.minimum_recovery_probability <= 1.0:
         impossible.append(f"minimum_recovery_probability={policy.minimum_recovery_probability}")
-    if policy.case_lifetime_days < 1:
+    if not 1 <= policy.case_lifetime_days <= 90:
         impossible.append(f"case_lifetime_days={policy.case_lifetime_days}")
     return impossible
 
@@ -300,6 +301,7 @@ def evaluate_action(
     confidence: float,
     recovery_probability: float,
     persist: bool = True,
+    authorized_by: Optional[str] = None,
 ) -> PolicyDecisionResponse:
     """
     Evaluate a proposed action against policy rules.
@@ -318,6 +320,13 @@ def evaluate_action(
             candidate actions by value; it is never an authorization.  Every
             evaluation that gates an action keeps the default persist=True and
             is the authoritative record.
+        authorized_by: Name of the human reviewer authorizing this action.  The
+            checks that exist to gate *autonomous* action (the pending-human-review
+            gate and the amount / confidence / probability thresholds) are then
+            satisfied or recorded as overridden by that named human, and the
+            decision reason names them.  Hard stops - a settled case, an expired
+            case, an exhausted retry / reminder / attempt budget - are never
+            overridden:  a human approval is not a bypass.
         
     Returns:
         PolicyDecisionResponse with decision and checks
@@ -354,13 +363,25 @@ def evaluate_action(
         return _create_decision(db, case, proposed_action, "BLOCKED",
                                "Case is closed", checks, confidence, recovery_probability, persist=persist)
 
-    # Check that no human decision is pending (ESCALATED cases are not autonomous)
-    check = check_human_review_required(case)
-    checks.append(check)
-    if not check.passed:
-        return _create_decision(db, case, proposed_action, "BLOCKED",
-                               "Case is escalated and awaiting human review", checks,
-                               confidence, recovery_probability, persist=persist)
+    # Check that no human decision is pending (ESCALATED cases are not autonomous).
+    # A named reviewer authorizing the action here *is* that pending human
+    # decision, so the gate is recorded as satisfied by them instead of silently
+    # disappearing from the audit trail.
+    if authorized_by:
+        checks.append(PolicyCheck(
+            rule="HUMAN_AUTHORISATION",
+            passed=True,
+            reason=f"Authorized by reviewer {authorized_by}",
+            value=1.0,
+            limit=1.0,
+        ))
+    else:
+        check = check_human_review_required(case)
+        checks.append(check)
+        if not check.passed:
+            return _create_decision(db, case, proposed_action, "BLOCKED",
+                                   "Case is escalated and awaiting human review", checks,
+                                   confidence, recovery_probability, persist=persist)
 
     # Check case expiry
     check = check_case_expiry(case, policy)
@@ -390,33 +411,58 @@ def evaluate_action(
         return _create_decision(db, case, proposed_action, "BLOCKED",
                                "Recovery attempt limit reached", checks, confidence, recovery_probability, persist=persist)
     
+    # The checks below gate *autonomous* action.  A named human reviewer who
+    # authorizes the action overrides them, so a failure is recorded in the stored
+    # checks and in the decision reason rather than sending the case back to a
+    # human who is already making the decision.
+    overridden: List[str] = []
+
     # Check amount limit
     check = check_amount_limit(case, policy)
     checks.append(check)
     if not check.passed:
-        # Amount exceeds limit - escalate to human
-        return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "Amount exceeds autonomous limit", checks, confidence, recovery_probability, persist=persist)
+        if authorized_by:
+            overridden.append(check.rule)
+        else:
+            # Amount exceeds limit - escalate to human
+            return _create_decision(db, case, proposed_action, "ESCALATED",
+                                   "Amount exceeds autonomous limit", checks, confidence, recovery_probability, persist=persist)
     
     # Check AI confidence
     check = check_ai_confidence(confidence, policy)
     checks.append(check)
     if not check.passed:
-        # Low confidence - escalate to human
-        return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "AI confidence below minimum threshold", checks, confidence, recovery_probability, persist=persist)
+        if authorized_by:
+            overridden.append(check.rule)
+        else:
+            # Low confidence - escalate to human
+            return _create_decision(db, case, proposed_action, "ESCALATED",
+                                   "AI confidence below minimum threshold", checks, confidence, recovery_probability, persist=persist)
     
     # Check recovery probability
     check = check_recovery_probability(recovery_probability, policy)
     checks.append(check)
     if not check.passed:
-        # Low recovery probability - escalate or no action
-        return _create_decision(db, case, proposed_action, "ESCALATED",
-                               "Recovery probability below minimum threshold", checks, confidence, recovery_probability, persist=persist)
+        if authorized_by:
+            overridden.append(check.rule)
+        else:
+            # Low recovery probability - escalate or no action
+            return _create_decision(db, case, proposed_action, "ESCALATED",
+                                   "Recovery probability below minimum threshold", checks, confidence, recovery_probability, persist=persist)
     
-    # All checks passed - approve the action
+    # All checks passed (or the autonomous thresholds were overridden by a named
+    # reviewer) - approve the action
+    if overridden:
+        reason = (f"Authorized by reviewer {authorized_by}; overridden autonomous "
+                  f"thresholds: {', '.join(overridden)}")
+    elif authorized_by:
+        reason = f"Authorized by reviewer {authorized_by}"
+    else:
+        reason = "All policy checks passed"
+
     return _create_decision(db, case, proposed_action, "APPROVED",
-                           "All policy checks passed", checks, confidence, recovery_probability, persist=persist)
+                           reason, checks, confidence, recovery_probability, persist=persist,
+                           authorized_by=authorized_by, overridden=overridden)
 
 
 def _create_decision(
@@ -429,9 +475,20 @@ def _create_decision(
     confidence: float,
     recovery_probability: float,
     persist: bool = True,
+    authorized_by: Optional[str] = None,
+    overridden: Optional[List[str]] = None,
 ) -> PolicyDecisionResponse:
     """Create a policy decision and, unless ``persist`` is False, store it."""
     if persist:
+        # Who made the decision: the engine alone, or a named human whose
+        # authorization the engine recorded.  Both are visible in the commit trail.
+        metadata = None
+        if authorized_by:
+            metadata = {
+                "authorized_by": authorized_by,
+                "overridden_rules": list(overridden or []),
+            }
+
         # Store decision in database
         policy_decision = PolicyDecision(
             case_id=case.id,
@@ -457,6 +514,7 @@ def _create_decision(
             policy_checks=[check.model_dump() for check in checks],
             action=proposed_action,
             result=decision,
+            metadata_=metadata,
         )
         db.add(audit_event)
         

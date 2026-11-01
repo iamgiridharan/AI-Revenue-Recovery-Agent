@@ -62,6 +62,7 @@ class AuditEventType(str, enum.Enum):
     ACTION_FAILED = "ACTION_FAILED"
     CASE_ESCALATED = "CASE_ESCALATED"
     CASE_CLOSED = "CASE_CLOSED"
+    HUMAN_REVIEW_COMPLETED = "HUMAN_REVIEW_COMPLETED"
 
 
 class PolicyDecisionType(str, enum.Enum):

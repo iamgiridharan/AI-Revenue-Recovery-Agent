@@ -37,6 +37,7 @@ def execute_recovery_action(
     confidence: float,
     recovery_probability: float,
     reason: str = "",
+    human_authorized_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute a recovery action for a revenue risk case.
@@ -50,6 +51,10 @@ def execute_recovery_action(
         confidence: AI confidence in recommendation
         recovery_probability: ML-predicted recovery probability
         reason: Reason for the action
+        human_authorized_by: Name of the human reviewer authorizing this action.
+            Set only by the human review flow: the Policy Engine then treats the
+            autonomous thresholds (amount / confidence / probability) as
+            overridden by that named reviewer. Hard policy stops still apply.
         
     Returns:
         Dictionary containing execution result
@@ -100,6 +105,7 @@ def execute_recovery_action(
         proposed_action=action_type,
         confidence=confidence,
         recovery_probability=recovery_probability,
+        authorized_by=human_authorized_by,
     )
     
     # Step 5: Check if action is allowed

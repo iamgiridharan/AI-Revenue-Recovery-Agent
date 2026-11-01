@@ -12,6 +12,7 @@ from app.api.policy import router as policy_router
 from app.api.webhooks import router as webhooks_router
 from app.api.dashboard import router as dashboard_router
 from app.api.simulation import router as simulation_router
+from app.api.reviews import router as reviews_router
 from app.utils.errors import (
     AppError,
     app_error_handler,
@@ -61,4 +62,5 @@ app.include_router(policy_router, prefix="/api")
 app.include_router(webhooks_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(simulation_router, prefix="/api")
+app.include_router(reviews_router, prefix="/api")
 

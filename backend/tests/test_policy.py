@@ -855,6 +855,60 @@ class TestPolicyAPI:
         
         assert response.status_code == 422  # Validation error
 
+    def test_update_policy_config_accepts_full_range_thresholds(self, client):
+        """
+        Thresholds of 1.0 and a 60-day lifetime must be storable.
+
+        A 1.0 confidence threshold is the documented "block everything" setting
+        and the UI offers it (0.1 - 1.0); it used to be rejected with a 422 whose
+        validation detail the UI rendered as "[object Object]".
+        """
+        response = client.put(
+            "/api/policies",
+            json={
+                "minimum_ai_confidence": 1.0,
+                "minimum_recovery_probability": 1.0,
+                "case_lifetime_days": 60,
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["minimum_ai_confidence"] == 1.0
+        assert data["minimum_recovery_probability"] == 1.0
+        assert data["case_lifetime_days"] == 60
+
+        # And the values are actually persisted, not just echoed back.
+        reloaded = client.get("/api/policies").json()
+        assert reloaded["minimum_ai_confidence"] == 1.0
+        assert reloaded["case_lifetime_days"] == 60
+
+    def test_confidence_above_one_is_rejected(self, client):
+        """1.0 is the ceiling; anything above it is still invalid."""
+        response = client.put("/api/policies", json={"minimum_ai_confidence": 1.5})
+
+        assert response.status_code == 422
+
+    def test_confidence_of_one_blocks_autonomous_actions(self, db_session, sample_case):
+        """A 1.0 threshold must hold every recommendation for human review."""
+        policy = get_active_policy(db_session)
+        policy.minimum_ai_confidence = 1.0
+        db_session.commit()
+
+        result = evaluate_action(
+            db=db_session,
+            case_id="CASE-001",
+            proposed_action=RecoveryActionEnum.CREATE_PAYMENT_LINK.value,
+            confidence=0.88,
+            recovery_probability=0.9,
+        )
+
+        assert result.allowed is False
+        assert result.decision == "ESCALATED"
+        assert any(
+            c.rule == "MINIMUM_AI_CONFIDENCE" and not c.passed for c in result.checks
+        )
+
     def test_evaluate_action_endpoint(self, client, sample_case):
         """Test POST /api/policies/evaluate endpoint."""
         response = client.post(

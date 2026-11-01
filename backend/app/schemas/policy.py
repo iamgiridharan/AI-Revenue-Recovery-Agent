@@ -78,21 +78,31 @@ class PolicyConfigUpdate(BaseModel):
     @field_validator("minimum_ai_confidence")
     @classmethod
     def validate_confidence(cls, v):
-        """Prevent obviously unsafe configurations."""
+        """Prevent obviously unsafe configurations.
+
+        The upper bound is 1.0, not a "realistic model" value: setting the
+        threshold to 1.0 is a legitimate way to stop all autonomous actions
+        (every recommendation is then held for human review), and the UI
+        advertises that range.
+        """
         if v is not None and v < 0.1:
             raise ValueError("Minimum AI confidence cannot be below 0.1")
-        if v is not None and v > 0.95:
-            raise ValueError("Minimum AI confidence cannot exceed 0.95 (no model achieves perfect confidence)")
+        if v is not None and v > 1.0:
+            raise ValueError("Minimum AI confidence cannot exceed 1.0")
         return v
     
     @field_validator("minimum_recovery_probability")
     @classmethod
     def validate_recovery_probability(cls, v):
-        """Prevent obviously unsafe configurations."""
+        """Prevent obviously unsafe configurations.
+
+        1.0 is accepted for the same reason as ``minimum_ai_confidence``: it is
+        a deliberate "never act autonomously" setting.
+        """
         if v is not None and v < 0.05:
             raise ValueError("Minimum recovery probability cannot be below 0.05")
-        if v is not None and v > 0.95:
-            raise ValueError("Minimum recovery probability cannot exceed 0.95 (no model predicts perfect recovery)")
+        if v is not None and v > 1.0:
+            raise ValueError("Minimum recovery probability cannot exceed 1.0")
         return v
     
 
