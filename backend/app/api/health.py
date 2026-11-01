@@ -48,3 +48,40 @@ def health_check():
             "database": db_status,
         },
     }
+
+
+@router.get("/config/status")
+def config_status():
+    """
+    Report whether payment actions reach a real provider or are mocked.
+
+    The response carries presence flags and a mode label only: key values and
+    secrets never leave the server. ``MOCK`` means executing an action produces
+    a ``mock.invalid`` link and calls no provider, so the UI is expected to
+    label it as such rather than implying money can move.
+    """
+    payments_configured = bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET)
+
+    # The prefix is public information and tells a test key from a live one;
+    # the key itself is never returned.
+    key_id = settings.RAZORPAY_KEY_ID
+    if key_id.startswith("rzp_test_"):
+        key_type = "test"
+    elif key_id.startswith("rzp_live_"):
+        key_type = "live"
+    elif key_id:
+        key_type = "unknown"
+    else:
+        key_type = None
+
+    return {
+        "success": True,
+        "data": {
+            "payments": {
+                "mode": "TEST_MODE" if payments_configured else "MOCK",
+                "razorpay_configured": payments_configured,
+                "key_type": key_type,
+                "webhook_configured": bool(settings.RAZORPAY_WEBHOOK_SECRET),
+            },
+        },
+    }

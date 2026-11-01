@@ -10,6 +10,7 @@ import {
   getDashboardPriorityChart,
   getDashboardDailyCases,
   getDashboardDailyRecovered,
+  getConfigStatus,
 } from '../services/api';
 
 const STATUS_COLORS = {
@@ -49,6 +50,63 @@ function formatCurrency(amount) {
   return '₹' + Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 }
 
+/**
+ * Says plainly whether executed recovery actions reach Razorpay or are mocked.
+ * Without keys every executed action returns a mock.invalid link that cannot be
+ * paid, so the dashboard must not imply that money can move.
+ */
+function PaymentModeBanner({ config }) {
+  if (!config || !config.payments) return null;
+  const payments = config.payments;
+  const isMock = payments.mode !== 'TEST_MODE';
+
+  return (
+    <div
+      className={`rounded-xl border p-4 ${isMock ? 'bg-amber-50 border-amber-200' : 'bg-blue-50 border-blue-200'}`}
+    >
+      <div className="flex items-start gap-3">
+        <span
+          className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide ${
+            isMock ? 'bg-amber-200 text-amber-900' : 'bg-blue-200 text-blue-900'
+          }`}
+        >
+          {isMock ? 'MOCK' : 'TEST MODE'}
+        </span>
+        <div className="min-w-0">
+          <p className={`text-sm font-semibold ${isMock ? 'text-amber-900' : 'text-blue-900'}`}>
+            {isMock
+              ? 'MOCK — no provider call'
+              : 'TEST MODE — Razorpay test keys loaded'}
+          </p>
+          <p className={`text-xs mt-0.5 ${isMock ? 'text-amber-800' : 'text-blue-800'}`}>
+            {isMock
+              ? 'Razorpay keys are not configured. Executing a recovery action creates a mock.invalid link that cannot be paid, so no customer can settle and no revenue can be booked as recovered.'
+              : 'Executing a recovery action creates a real Razorpay test-mode link. Revenue is booked only when a signature-verified webhook confirms the payment.'}
+          </p>
+          {isMock ? (
+            <p className="text-[11px] text-amber-700 mt-1">
+              Add RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET to backend/.env to switch to Test Mode.
+            </p>
+          ) : (
+            <div className="text-[11px] mt-1 space-y-0.5">
+              {!payments.webhook_configured && (
+                <p className="text-red-700">
+                  Webhook secret is not configured: every webhook is rejected with 401, so no payment can settle.
+                </p>
+              )}
+              {payments.key_type === 'live' && (
+                <p className="text-red-700">
+                  Live keys detected — this build is intended for Test Mode only.
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [statusData, setStatusData] = useState([]);
@@ -57,6 +115,7 @@ export default function Dashboard() {
   const [dailyRecovered, setDailyRecovered] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [config, setConfig] = useState(null);
 
   useEffect(() => {
     async function fetchData() {
@@ -80,6 +139,14 @@ export default function Dashboard() {
       }
     }
     fetchData();
+  }, []);
+
+  // Non-blocking: if the status endpoint is unavailable the dashboard still loads,
+  // it just cannot state the payment mode.
+  useEffect(() => {
+    getConfigStatus()
+      .then((res) => setConfig(res.data))
+      .catch(() => setConfig(null));
   }, []);
 
   if (loading) {
@@ -115,6 +182,8 @@ export default function Dashboard() {
         <h1 className="text-2xl font-bold text-gray-900">Overview</h1>
         <p className="text-sm text-gray-500 mt-1">Revenue recovery metrics and system status</p>
       </div>
+
+      <PaymentModeBanner config={config} />
 
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

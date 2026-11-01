@@ -4,7 +4,7 @@ An AI-powered system that detects failed payments, predicts recovery probability
 
 **Status:** MVP Complete — Recovery Pipeline Verified ✅  
 **Payment Integration:** Razorpay Test Mode ONLY  
-**Latest Verification:** 390 automated tests passing; simulated recovery outcomes and the controlled Test Mode recovery flow (locally executed against a stub provider) confirmed
+**Latest Verification:** 416 automated tests passing; simulated recovery outcomes, the controlled Test Mode recovery flow (locally executed against a stub provider), the human-review flow, and MOCK-vs-Test-Mode reporting on the dashboard confirmed
 
 ---
 
@@ -31,7 +31,7 @@ An end-to-end AI agent that:
 The project has been verified end-to-end with the following results:
 
 ### Automated Tests
-- **303 tests passing** across 10 test files
+- **416 tests passing** across 13 test files
 - Coverage includes models, API endpoints, ML pipeline, agent service, policy engine, payment integration, dashboard, simulation, and end-to-end scenarios
 
 ### Simulated Recovery Outcomes
@@ -63,7 +63,7 @@ The verification confirmed:
 
 The previous issue where all cases were being escalated (0% recovery rate) was investigated and fixed:
 
-- **Root cause:** The `policy_configs` table contained extreme values (e.g., `autonomous_amount_limit=0`, `minimum_ai_confidence=1.0`) that made recovery mathematically impossible.
+- **Root cause:** The `policy_configs` table contained values that made recovery mathematically impossible (e.g., `autonomous_amount_limit=0`, or `minimum_ai_confidence=1.0`, which blocks every autonomous action).
 - **Fix:** Added policy sanity validation, tightened API validators, and corrected simulation confidence behavior.
 - **Result:** Realistic mix of RECOVERED, OPEN, and ESCALATED outcomes now produced consistently.
 
@@ -150,7 +150,7 @@ ai-revenue-recovery-agent/
 ├── backend/                    # FastAPI application
 │   ├── app/
 │   │   ├── api/               # Route handlers
-│   │   │   ├── health.py      # GET /api/health
+│   │   │   ├── health.py      # GET /api/health, /api/config/status
 │   │   │   ├── cases.py       # GET /api/cases, GET /api/cases/{id}
 │   │   │   ├── ml.py          # POST /api/ml/predict, GET /api/ml/health
 │   │   │   ├── agent.py       # POST /api/agent/diagnose
@@ -171,7 +171,7 @@ ai-revenue-recovery-agent/
 │   │   │   ├── dashboard_service.py # Dashboard aggregates
 │   │   │   └── simulation_service.py # Batch simulation
 │   │   └── utils/             # Errors, logging
-│   ├── tests/                 # 10 test files, 303 tests
+│   ├── tests/                 # 13 test files, 416 tests
 │   ├── alembic/               # Database migrations
 │   └── requirements.txt
 ├── frontend/                   # React SPA
@@ -300,10 +300,15 @@ The Policy Engine validates every AI recommendation before execution.
 
 ### Policy Validation
 
-The system includes sanity validation to prevent configurations that would make recovery impossible:
-- `autonomous_amount_limit` must be ≥ 100
-- `minimum_ai_confidence` must be ≤ 0.95
-- `minimum_recovery_probability` must be ≤ 0.95
+The system includes sanity validation to prevent configurations that are out of range:
+- `autonomous_amount_limit` must be between 100 and 100,000
+- `minimum_ai_confidence` must be between 0.1 and 1.0
+- `minimum_recovery_probability` must be between 0.05 and 1.0
+- `case_lifetime_days` must be between 1 and 90
+
+A threshold of exactly `1.0` is valid and means **no autonomous action**: every
+recommendation is escalated to human review. This is the strictest safe setting, and the
+Policy Settings UI offers it (0.1 - 1.0).
 
 Invalid configurations are **rejected by the API** (`PUT /api/policies` returns a validation
 error). Runtime reads never rewrite a stored policy: values outside these ranges are logged
@@ -422,6 +427,41 @@ only selects the action (`{"action_type": "RETRY", "reason": "..."}`, both optio
 
 The case is only marked `RECOVERED` by a verified payment webhook.
 
+### Human Review of Escalated Cases
+
+A case the Policy Engine refuses to authorize autonomously becomes `ESCALATED`, and
+`HUMAN_REVIEW_REQUIRED` then blocks every further action on it. Only a named reviewer
+can resolve it, through `POST /api/cases/{case_id}/review`:
+
+```json
+{ "reviewer": "Asha Reviewer", "decision": "APPROVE", "note": "Verified by phone" }
+```
+
+| Decision | Effect |
+|---|---|
+| `APPROVE` | Executes the **recorded** AI recommendation on the reviewer's authority |
+| `OVERRIDE` | Executes a **different** executable action (`action_type` required); a note of at least 5 characters is required |
+| `CLOSE` | `CLOSED` without recovering anything |
+| `MARK_UNRECOVERABLE` | `CLOSED` as uncollectable; a reason is required |
+
+- **Approval is not a bypass.** The Policy Engine is re-run with the reviewer named as
+the authorizing human (`evaluate_action(..., authorized_by=...)`). The *autonomy*
+thresholds that caused the escalation — `AUTONOMOUS_AMOUNT_LIMIT`,
+`MINIMUM_AI_CONFIDENCE`, `MINIMUM_RECOVERY_PROBABILITY` — are recorded as overridden by
+that reviewer. Hard stops still refuse: a settled case, an expired case, and an
+exhausted retry / reminder / attempt budget return **409**, the case stays `ESCALATED`,
+and the refusal is recorded against the reviewer.
+- Every decision, including a refusal, writes a **`HUMAN_REVIEW_COMPLETED`** audit
+event whose `actor` is the reviewer, with the overridden rule names in its metadata.
+- The request can never carry the amount (always the failed transaction) or the
+confidence / recovery probability (always the recorded diagnosis).
+- A `RECOVERED` case is never closed, and a non-escalated case cannot be approved.
+- `GET /api/reviews/queue` lists what is waiting, with the policy rule that escalated
+each case (taken from the recorded escalation event, never re-derived).
+
+The reviewer UI is the **Human Review** panel on the case page, reachable from the
+**Human review queue** card on the Cases page.
+
 ### Webhook Events Handled
 
 - `payment.captured` / `payment_link.paid` → **settles** the case (status `RECOVERED`,
@@ -472,8 +512,10 @@ Razorpay only delivers webhooks to a public HTTPS URL. For a demonstration eithe
 
 1. Put the three values above in `backend/.env`, then restart the backend so the
    settings are re-read.
-2. Confirm they are loaded: `GET /api/health` (and check the startup log line
-   `Razorpay client initialized successfully (Test Mode)`).
+2. Confirm they are loaded: `GET /api/config/status` must report
+   `"mode": "TEST_MODE"` and `"webhook_configured": true` (the Dashboard banner
+   turns from amber `MOCK` to blue `TEST MODE`), and check the startup log line
+   `Razorpay client initialized successfully (Test Mode)`.
 3. Start the public endpoint (deploy, or `ngrok http 8000`) and set that URL as the
    webhook in the Razorpay dashboard, with the same secret as
    `RAZORPAY_WEBHOOK_SECRET`.
@@ -561,10 +603,14 @@ Each simulation produces a realistic distribution of outcomes based on ML predic
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Health check |
+| GET | `/api/config/status` | Payment mode (`TEST_MODE` / `MOCK`) and presence flags — never keys |
 | GET | `/api/cases` | List cases (paginated, filterable) |
 | GET | `/api/cases/{case_id}` | Get case detail |
 | GET | `/api/cases/{case_id}/detail` | Full case with related entities |
 | GET | `/api/cases/{case_id}/value` | Estimated recovery value (estimates only; never authorizes) |
+| POST | `/api/cases/{case_id}/recovery` | Execute the recorded recommendation (policy-authorized) |
+| POST | `/api/cases/{case_id}/review` | Human review of an escalated case (approve / override / close) |
+| GET | `/api/reviews/queue` | Escalated cases awaiting review, with the blocking rule |
 | POST | `/api/ml/predict` | ML recovery prediction |
 | POST | `/api/ml/predict/batch` | Batch ML predictions |
 | GET | `/api/ml/model` | Model information |
@@ -664,14 +710,14 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-**Current status: 303 tests passing across 10 test files.**
+**Current status: 416 tests passing across 13 test files.**
 
 ### Test Files
 
 | File | Coverage |
 |------|----------|
 | `test_models.py` | Database models, enums, relationships |
-| `test_api.py` | Health, cases API |
+| `test_api.py` | Health, payment-mode reporting, cases API |
 | `test_ml.py` | ML preprocessing, training, prediction |
 | `test_ml_inference_integration.py` | ML API integration, validation |
 | `test_agent.py` | AI agent tools, service, API |
@@ -679,6 +725,9 @@ python -m pytest tests/ -v
 | `test_payment.py` | Razorpay, webhooks, recovery |
 | `test_dashboard.py` | Dashboard stats, charts, audit |
 | `test_simulation.py` | Simulation service, API |
+| `test_recovery_execution.py` | Controlled recovery execution, mock vs Test Mode |
+| `test_review.py` | Human review of escalated cases: approve, override, close, refused approvals |
+| `test_value.py` | Value scoring, eligibility, ranking |
 | `test_e2e_scenarios.py` | Critical end-to-end scenarios |
 
 ### Critical E2E Scenarios
@@ -766,7 +815,8 @@ python -m pytest tests/ -v
 
 **Policy Configuration:**
 - Update policy settings via `PUT /api/policies`
-- Show validation errors for extreme values (e.g., `{"minimum_ai_confidence": 1.0}`)
+- Show validation errors for out-of-range values (e.g., `{"minimum_ai_confidence": 1.5}`)
+- Setting `minimum_ai_confidence` to `1.0` is accepted and blocks every autonomous action
 
 ---
 

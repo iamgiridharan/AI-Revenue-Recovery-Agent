@@ -1,6 +1,9 @@
 import pytest
+from types import SimpleNamespace
+
 from tests.conftest import db_session
 from app.models import Customer, Transaction, RevenueRiskCase
+import app.api.health as health_module
 
 
 def create_test_data(db_session):
@@ -51,6 +54,94 @@ class TestHealthEndpoint:
         assert data["success"] is True
         assert data["data"]["status"] == "healthy"
         assert "version" in data["data"]
+
+
+def _fake_settings(**overrides):
+    """Settings stand-in for /config/status; only the fields it reads."""
+    values = {
+        "RAZORPAY_KEY_ID": "",
+        "RAZORPAY_KEY_SECRET": "",
+        "RAZORPAY_WEBHOOK_SECRET": "",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class TestConfigStatusEndpoint:
+    """Test GET /api/config/status (payment mode reporting)."""
+
+    def test_mock_mode_without_keys(self, client, monkeypatch):
+        """No credentials means the system runs mocked and says so."""
+        monkeypatch.setattr(health_module, "settings", _fake_settings())
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "MOCK"
+        assert payments["razorpay_configured"] is False
+        assert payments["key_type"] is None
+        assert payments["webhook_configured"] is False
+
+    def test_test_mode_with_full_credentials(self, client, monkeypatch):
+        """Test keys + webhook secret are reported as TEST MODE."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(
+                RAZORPAY_KEY_ID="rzp_test_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="whsec-secret-value",
+            ),
+        )
+        response = client.get("/api/config/status")
+        payments = response.json()["data"]["payments"]
+        assert payments["mode"] == "TEST_MODE"
+        assert payments["razorpay_configured"] is True
+        assert payments["key_type"] == "test"
+        assert payments["webhook_configured"] is True
+
+        # Only presence flags may leave the server: never the key or the secrets.
+        body = response.text
+        assert "rzp_test_keyid_123" not in body
+        assert "super-secret-value" not in body
+        assert "whsec-secret-value" not in body
+
+    def test_partial_credentials_stay_mock(self, client, monkeypatch):
+        """A key id without its secret cannot reach Razorpay, so it stays MOCK."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(RAZORPAY_KEY_ID="rzp_test_keyid_123"),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "MOCK"
+        assert payments["razorpay_configured"] is False
+        assert payments["key_type"] == "test"
+
+    def test_webhook_missing_is_reported_separately(self, client, monkeypatch):
+        """Real keys without a webhook secret: TEST MODE, but settlement is dead."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(
+                RAZORPAY_KEY_ID="rzp_test_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+            ),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "TEST_MODE"
+        assert payments["webhook_configured"] is False
+
+    def test_live_keys_are_labelled(self, client, monkeypatch):
+        """A live key prefix is reported as such so the UI can warn about it."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(
+                RAZORPAY_KEY_ID="rzp_live_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+            ),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "TEST_MODE"
+        assert payments["key_type"] == "live"
 
 
 class TestListCasesEndpoint:
