@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getCaseFullDetail, executeRecovery } from '../services/api';
+import { getCaseFullDetail, executeRecovery, diagnoseCase, reviewCase } from '../services/api';
 
 const STATUS_STYLES = {
   OPEN: 'bg-blue-50 text-blue-700 border-blue-200',
@@ -25,27 +25,134 @@ const TIMELINE_STEPS = [
 // A case the autonomous flow must not act on again.
 const SETTLED_STATUSES = new Set(['RECOVERED', 'CLOSED']);
 
+// Actions the recovery service can actually execute. The remaining agent actions
+// (NO_ACTION, WAIT_AND_RETRY, ESCALATE_TO_HUMAN, MARK_UNRECOVERABLE) are
+// decisions rather than executable recovery attempts.
+const EXECUTABLE_ACTIONS = ['CREATE_PAYMENT_LINK', 'RETRY', 'SEND_PAYMENT_REMINDER'];
+
 /**
- * Execute the case's recorded AI recommendation.
+ * Run the AI agent on this case.
  *
- * The backend authorizes the action with the Policy Engine and creates a Razorpay
- * Test Mode payment link. When no credentials are configured it returns
- * `execution_mode: "MOCK"`, which means no provider call was made and the link
- * cannot be paid - that is shown explicitly rather than as a payment.
+ * The agent reads the transaction, customer history and ML prediction and returns
+ * a validated recommendation. It never executes a payment: the recommendation is
+ * authorised by the Policy Engine when an action is executed below.
  */
-function RecoveryExecution({ caseId, status, onExecuted }) {
+function DiagnosisPanel({ caseId, status, onDiagnosed }) {
+  const [running, setRunning] = useState(false);
+  const [recommendation, setRecommendation] = useState(null);
+  const [error, setError] = useState(null);
+
+  const settled = SETTLED_STATUSES.has(status);
+
+  async function handleDiagnose() {
+    setRunning(true);
+    setError(null);
+    setRecommendation(null);
+    try {
+      const res = await diagnoseCase(caseId);
+      setRecommendation(res.data);
+      if (onDiagnosed) onDiagnosed();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <Section title="AI Agent Diagnosis">
+      <p className="text-sm text-gray-500 mb-3">
+        Runs the agent on this case and records its recommendation (diagnosis,
+        action, confidence, recovery probability). The recommendation is advisory:
+        the Policy Engine authorises the action, never the agent.
+      </p>
+
+      <button
+        onClick={handleDiagnose}
+        disabled={running || settled}
+        className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-2"
+      >
+        {running && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />}
+        {settled ? 'Case already settled' : running ? 'Diagnosing\u2026' : 'Run AI diagnosis'}
+      </button>
+
+      {error && (
+        <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+          <p className="text-xs font-semibold text-red-700 mb-0.5">Diagnosis not recorded</p>
+          <p className="text-sm text-red-800">{error}</p>
+        </div>
+      )}
+
+      {recommendation && (
+        <div className="mt-3 border border-gray-200 rounded-lg p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-bold tracking-wide px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+              RECOMMENDATION
+            </span>
+            <span className="text-xs text-gray-500">
+              {recommendation.recommended_action?.replace(/_/g, ' ')}
+              {' \u00b7 '}confidence {formatPercent(recommendation.confidence)}
+              {' \u00b7 '}recovery probability {formatPercent(recommendation.recovery_probability)}
+            </span>
+          </div>
+
+          <p className="text-sm text-gray-700 leading-relaxed">{recommendation.diagnosis}</p>
+          {recommendation.reasoning_summary && (
+            <p className="text-xs text-gray-500">{recommendation.reasoning_summary}</p>
+          )}
+          {recommendation.customer_message && (
+            <div className="bg-gray-50 border border-gray-100 rounded-lg p-2">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-0.5">
+                Customer message
+              </p>
+              <p className="text-xs text-gray-600">{recommendation.customer_message}</p>
+            </div>
+          )}
+          {!EXECUTABLE_ACTIONS.includes(recommendation.recommended_action) && (
+            <p className="text-[11px] text-amber-700">
+              This recommendation is a decision, not an executable recovery action.
+              Pick an executable action below to attempt recovery.
+            </p>
+          )}
+          <p className="text-[11px] text-gray-400">
+            The policy decision for this recommendation is recorded in the audit log.
+          </p>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+/**
+ * Execute a chosen recovery action for the case.
+ *
+ * The caller chooses *which* action to execute; the amount always comes from the
+ * failed transaction record and the confidence / recovery probability are always
+ * the recorded diagnosis values (never caller input). The backend authorises the
+ * action with the Policy Engine first. When no Razorpay Test Mode credentials are
+ * configured it returns `execution_mode: "MOCK"`, which means no provider call
+ * was made and the link cannot be paid - shown explicitly rather than as a
+ * payment.
+ */
+function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
+  const recordedExecutable = EXECUTABLE_ACTIONS.includes(recommendedAction);
+  const [actionType, setActionType] = useState(
+    recordedExecutable ? recommendedAction : 'CREATE_PAYMENT_LINK'
+  );
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
   const settled = SETTLED_STATUSES.has(status);
+  const escalated = status === 'ESCALATED';
+  const blocked = settled || escalated;
 
   async function handleExecute() {
     setRunning(true);
     setError(null);
     setResult(null);
     try {
-      const res = await executeRecovery(caseId, {});
+      const res = await executeRecovery(caseId, { action_type: actionType });
       setResult(res.data);
       if (onExecuted) onExecuted();
     } catch (err) {
@@ -58,18 +165,67 @@ function RecoveryExecution({ caseId, status, onExecuted }) {
   return (
     <Section title="Execute Recovery Action (Razorpay Test Mode)">
       <p className="text-sm text-gray-500 mb-3">
-        Executes this case&apos;s recorded AI recommendation. The Policy Engine must
-        approve it before any payment link is created, and the amount always comes
-        from the failed transaction record.
+        Choose which recovery action to attempt. The Policy Engine must approve it
+        before any payment link is created, the amount always comes from the failed
+        transaction record, and confidence / recovery probability always come from
+        the recorded AI diagnosis.
       </p>
+
+      {/* Action picker */}
+      <div className="flex flex-wrap gap-2 mb-2">
+        {EXECUTABLE_ACTIONS.map((action) => {
+          const selected = actionType === action;
+          return (
+            <button
+              key={action}
+              type="button"
+              onClick={() => setActionType(action)}
+              disabled={blocked}
+              className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                selected
+                  ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
+                  : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+              } disabled:opacity-40`}
+            >
+              {action.replace(/_/g, ' ')}
+              {action === recommendedAction && (
+                <span className="ml-1 text-[10px] text-gray-400">(AI pick)</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      <p className="text-xs text-gray-500 mb-3">
+        {recommendedAction
+          ? <>Recorded AI recommendation: <span className="font-medium text-gray-700">
+              {recommendedAction.replace(/_/g, ' ')}
+            </span>{!recordedExecutable && ' \u2014 a decision, not an executable action'}.</>
+          : <>This case has no recorded AI recommendation yet; run the diagnosis above first.</>}
+      </p>
+
+      {escalated && (
+        <div className="mb-3 bg-orange-50 border border-orange-200 rounded-lg p-3">
+          <p className="text-xs font-semibold text-orange-800 mb-0.5">Awaiting human review</p>
+          <p className="text-sm text-orange-800">
+            This case was escalated, so the Policy Engine refuses autonomous action
+            on it. Use the Human Review panel above: a named reviewer approves,
+            overrides or closes it, and that decision releases this gate.
+          </p>
+        </div>
+      )}
 
       <button
         onClick={handleExecute}
-        disabled={running || settled}
+        disabled={running || blocked}
         className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-40 flex items-center gap-2"
       >
         {running && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />}
-        {settled ? 'Case already settled' : 'Execute recovery action'}
+        {settled
+          ? 'Case already settled'
+          : escalated
+            ? 'Awaiting human review'
+            : `Execute ${actionType.replace(/_/g, ' ').toLowerCase()}`}
       </button>
 
       {error && (
@@ -97,6 +253,7 @@ function RecoveryExecution({ caseId, status, onExecuted }) {
           </div>
 
           <InfoRow label="Action" value={result.action_type?.replace(/_/g, ' ')} />
+          {result.message && <InfoRow label="Result" value={result.message} />}
           <InfoRow label="Amount" value={formatCurrency(result.amount)} />
           <InfoRow label="Payment Link ID" value={result.payment_link_id} />
           <InfoRow label="Provider Status" value={result.provider_status} />
@@ -116,6 +273,263 @@ function RecoveryExecution({ caseId, status, onExecuted }) {
             The case is marked RECOVERED only by a verified payment webhook whose
             captured amount matches the amount due.
           </p>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+/**
+ * Human review of an escalated case.
+ *
+ * The Policy Engine refused to authorize this case on its own, so it waits for a
+ * named human. APPROVE / OVERRIDE re-run the Policy Engine with the reviewer named
+ * as the authorizing human - the autonomy thresholds that caused the escalation no
+ * longer stop the action - while hard stops (an expired case, an exhausted attempt
+ * budget) still refuse it. CLOSE / MARK_UNRECOVERABLE end the case without
+ * recovering it.
+ *
+ * The amount and the recorded confidence are never editable here: the amount is
+ * always the failed transaction's and the confidence is always the recorded
+ * diagnosis's.
+ */
+function ReviewPanel({ caseId, status, recommendedAction, onReviewed }) {
+  const escalated = status === 'ESCALATED';
+  const recordedExecutable = EXECUTABLE_ACTIONS.includes(recommendedAction);
+
+  const [reviewer, setReviewer] = useState(() => {
+    try {
+      return window.localStorage.getItem('reviewer') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [note, setNote] = useState('');
+  const [actionType, setActionType] = useState(
+    recordedExecutable ? recommendedAction : 'CREATE_PAYMENT_LINK'
+  );
+  const [pending, setPending] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  if (!escalated) return null;
+
+  const nameOk = reviewer.trim().length >= 2;
+  const reasonOk = note.trim().length >= 5;
+  const actionMatchesRecorded = actionType === recommendedAction;
+  const canApprove = nameOk && recordedExecutable && actionMatchesRecorded;
+  const canOverride = nameOk && reasonOk && !actionMatchesRecorded;
+
+  async function submit(decision) {
+    setPending(decision);
+    setError(null);
+    setResult(null);
+    try {
+      try {
+        window.localStorage.setItem('reviewer', reviewer.trim());
+      } catch {
+        // Storing the name is a convenience only.
+      }
+      const res = await reviewCase(caseId, {
+        reviewer: reviewer.trim(),
+        decision,
+        action_type: decision === 'CLOSE' ? undefined : actionType,
+        note: note.trim(),
+      });
+      setResult({ decision, data: res.data });
+      setNote('');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPending(null);
+      if (onReviewed) onReviewed();
+    }
+  }
+
+  return (
+    <Section title="Human Review">
+      <div className="flex items-center gap-2 mb-3">
+        <span className="text-[10px] font-bold tracking-wide px-2 py-0.5 rounded bg-orange-50 text-orange-700 border border-orange-200">
+          AWAITING REVIEW
+        </span>
+        <span className="text-xs text-gray-500">
+          The Policy Engine escalated this case instead of acting on its own. Every
+          decision below is recorded against the reviewer named here.
+        </span>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        <div>
+          <label className="block text-xs font-medium text-gray-500 mb-1">
+            Reviewer name
+          </label>
+          <input
+            type="text"
+            value={reviewer}
+            onChange={(e) => setReviewer(e.target.value)}
+            placeholder="Who is deciding?"
+            className="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-500 mb-1">
+            Note / reason (required to override or write off)
+          </label>
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="Why this decision?"
+            className="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
+          />
+        </div>
+      </div>
+
+      {/* Action being authorized */}
+      <p className="text-xs font-medium text-gray-500 mb-1">
+        Action to authorize
+      </p>
+      <div className="flex flex-wrap gap-2 mb-2">
+        {EXECUTABLE_ACTIONS.map((action) => {
+          const selected = actionType === action;
+          return (
+            <button
+              key={action}
+              type="button"
+              onClick={() => setActionType(action)}
+              disabled={pending !== null}
+              className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                selected
+                  ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
+                  : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+              } disabled:opacity-40`}
+            >
+              {action.replace(/_/g, ' ')}
+              {action === recommendedAction && (
+                <span className="ml-1 text-[10px] text-gray-400">(AI pick)</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      <p className="text-xs text-gray-500 mb-3">
+        {recommendedAction
+          ? <>Recorded AI recommendation: <span className="font-medium text-gray-700">
+              {recommendedAction.replace(/_/g, ' ')}
+            </span>{!recordedExecutable && ' \u2014 a decision, not an executable action, so it cannot be approved as-is: pick an action and override'}.</>
+          : <>This case has no recorded AI recommendation; only closing it is possible.</>}
+      </p>
+
+      <div className="flex flex-wrap gap-2 mb-2">
+        <button
+          onClick={() => submit('APPROVE')}
+          disabled={!canApprove || pending !== null}
+          className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-40 flex items-center gap-2"
+        >
+          {pending === 'APPROVE' && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />}
+          Approve &amp; execute
+        </button>
+        <button
+          onClick={() => submit('OVERRIDE')}
+          disabled={!canOverride || pending !== null}
+          className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-2"
+        >
+          {pending === 'OVERRIDE' && <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white" />}
+          Override &amp; execute
+        </button>
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3">
+        Approve runs the recorded recommendation. Override runs the action selected
+        above instead and needs a note. A hard policy stop - an expired case, an
+        exhausted attempt budget - still refuses either one.
+      </p>
+
+      <div className="border-t border-gray-100 pt-3">
+        <p className="text-xs font-medium text-gray-500 mb-2">
+          Resolve without recovering
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => submit('CLOSE')}
+            disabled={!nameOk || pending !== null}
+            className="px-3 py-1.5 text-xs border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 disabled:opacity-40 flex items-center gap-2"
+          >
+            {pending === 'CLOSE' && <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-700" />}
+            Close case
+          </button>
+          <button
+            onClick={() => submit('MARK_UNRECOVERABLE')}
+            disabled={!nameOk || !reasonOk || pending !== null}
+            className="px-3 py-1.5 text-xs border border-red-200 rounded-lg text-red-700 hover:bg-red-50 disabled:opacity-40 flex items-center gap-2"
+          >
+            {pending === 'MARK_UNRECOVERABLE' && <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-red-700" />}
+            Mark unrecoverable
+          </button>
+        </div>
+        <p className="text-[11px] text-gray-400 mt-2">
+          Closing stops all recovery on this case without booking revenue. A settled
+          case is never closed.
+        </p>
+      </div>
+
+      {error && (
+        <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+          <p className="text-xs font-semibold text-red-700 mb-0.5">Review refused</p>
+          <p className="text-sm text-red-800">{error}</p>
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-3 border border-gray-200 rounded-lg p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-bold tracking-wide px-2 py-0.5 rounded bg-green-50 text-green-700 border border-green-200">
+              {result.decision}
+            </span>
+            <span className="text-xs text-gray-500">
+              Recorded against {result.data.reviewer} \u00b7 case is now{' '}
+              {String(result.data.case_status).replace(/_/g, ' ')}
+            </span>
+          </div>
+
+          {result.data.execution && (
+            <>
+              <div className="flex items-center gap-2">
+                <span className={`text-[10px] font-bold tracking-wide px-2 py-0.5 rounded border ${
+                  result.data.execution.mock
+                    ? 'bg-amber-50 text-amber-700 border-amber-200'
+                    : 'bg-blue-50 text-blue-700 border-blue-200'
+                }`}>
+                  {result.data.execution.execution_mode}
+                </span>
+                <span className="text-xs text-gray-500">
+                  {result.data.execution.mock
+                    ? 'No Razorpay call was made: placeholder link, no payment possible.'
+                    : 'Real Razorpay Test Mode payment link.'}
+                </span>
+              </div>
+              <InfoRow label="Action executed" value={result.data.execution.action_type?.replace(/_/g, ' ')} />
+              <InfoRow label="Amount" value={formatCurrency(result.data.execution.amount)} />
+              {result.data.execution.message && (
+                <InfoRow label="Result" value={result.data.execution.message} />
+              )}
+              {result.data.execution.payment_link && (
+                <a
+                  href={result.data.execution.payment_link}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-block text-sm text-blue-600 hover:text-blue-800 underline break-all"
+                >
+                  {result.data.execution.payment_link}
+                </a>
+              )}
+            </>
+          )}
+
+          {result.data.policy_decision && (
+            <p className="text-[11px] text-gray-400">
+              Policy: {result.data.policy_decision.decision} \u2014 {result.data.policy_decision.reason}
+            </p>
+          )}
         </div>
       )}
     </Section>
@@ -464,13 +878,29 @@ export default function CaseDetail() {
             </div>
           </Section>
 
+          {/* Run the agent on this case */}
+          <DiagnosisPanel
+            caseId={caseData.case_id}
+            status={caseData.status}
+            onDiagnosed={fetchDetail}
+          />
+
           {/* Estimated recovery value (estimates only) */}
           <ValueAssessment assessment={valueAssessment} />
+
+          {/* Human review (escalated cases only) */}
+          <ReviewPanel
+            caseId={caseData.case_id}
+            status={caseData.status}
+            recommendedAction={caseData.recommended_action}
+            onReviewed={fetchDetail}
+          />
 
           {/* Controlled recovery execution (Phase 4) */}
           <RecoveryExecution
             caseId={caseData.case_id}
             status={caseData.status}
+            recommendedAction={caseData.recommended_action}
             onExecuted={fetchDetail}
           />
 

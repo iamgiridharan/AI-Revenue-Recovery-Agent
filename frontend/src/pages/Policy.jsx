@@ -19,6 +19,18 @@ function InputField({ label, value, onChange, type = 'number', min, max, step, d
   );
 }
 
+const FIELD_LABELS = {
+  max_retries: 'Maximum Retries',
+  max_reminders: 'Maximum Reminders',
+  max_recovery_attempts: 'Max Recovery Attempts',
+  autonomous_amount_limit: 'Autonomous Amount Limit',
+  minimum_ai_confidence: 'Minimum AI Confidence',
+  minimum_recovery_probability: 'Minimum Recovery Probability',
+  case_lifetime_days: 'Case Lifetime (days)',
+};
+
+const NUMERIC_FIELDS = Object.keys(FIELD_LABELS);
+
 export default function Policy() {
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -56,9 +68,20 @@ export default function Policy() {
   };
 
   const handleSave = async () => {
-    setSaving(true);
     setError(null);
     setSuccess(false);
+
+    // A cleared number input parses to NaN, which would be sent as null and
+    // rejected by the API. Catch it here with the field name instead.
+    const invalid = NUMERIC_FIELDS.filter((field) => !Number.isFinite(config[field]));
+    if (invalid.length) {
+      setError(
+        `Enter a number for: ${invalid.map((field) => FIELD_LABELS[field]).join(', ')}`
+      );
+      return;
+    }
+
+    setSaving(true);
     try {
       const updates = {};
       if (config.max_retries !== originalConfig.max_retries) updates.max_retries = config.max_retries;

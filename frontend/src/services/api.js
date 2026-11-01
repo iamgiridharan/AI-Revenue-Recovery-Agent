@@ -8,23 +8,53 @@ const api = axios.create({
   },
 });
 
+// Turn a FastAPI error payload into a message a human can act on.
+// Validation failures arrive as `detail: [{ loc, msg, type }]`; passing that
+// array to `new Error()` produced the useless "[object Object]" banner.
+export function formatErrorMessage(error) {
+  const data = error.response?.data;
+  const detail = data?.detail ?? data?.error?.message;
+
+  if (typeof detail === 'string' && detail.trim()) return detail;
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (!item || typeof item !== 'object') return null;
+        const msg = item.msg || item.message;
+        if (!msg) return null;
+        const field = Array.isArray(item.loc)
+          ? item.loc.filter((part) => part !== 'body' && part !== 'query').join('.')
+          : '';
+        // Pydantic prefixes custom validator messages with "Value error, ".
+        const clean = String(msg).replace(/^Value error, /, '');
+        return field ? `${field}: ${clean}` : clean;
+      })
+      .filter(Boolean);
+
+    if (messages.length) return messages.join('; ');
+  }
+
+  if (detail && typeof detail === 'object') {
+    return detail.msg || detail.message || JSON.stringify(detail);
+  }
+
+  return error.message || 'An unexpected error occurred';
+}
+
 // Response interceptor for error handling
 api.interceptors.response.use(
   (response) => response.data,
-  (error) => {
-    const message =
-      error.response?.data?.detail ||
-      error.response?.data?.error?.message ||
-      error.message ||
-      'An unexpected error occurred';
-    return Promise.reject(new Error(message));
-  }
+  (error) => Promise.reject(new Error(formatErrorMessage(error)))
 );
 
 // ============================================================================
 // Health
 // ============================================================================
 export const healthCheck = () => api.get('/health');
+// Presence flags + mode label only: never returns Razorpay keys or secrets.
+export const getConfigStatus = () => api.get('/config/status');
 
 // ============================================================================
 // Dashboard
@@ -81,6 +111,27 @@ export const getAuditEvents = (params = {}) => {
 // ============================================================================
 export const diagnoseCase = (caseId) =>
   api.post('/agent/diagnose', { case_id: caseId });
+
+// ============================================================================
+// Human review
+// ============================================================================
+// An ESCALATED case is one the Policy Engine refused to authorize on its own, so
+// it waits for a named human. The queue is read-only; the review endpoint records
+// the decision (approve, override, close) against that reviewer.
+export const getReviewQueue = (limit = 100) =>
+  api.get(`/reviews/queue?limit=${limit}`);
+
+export const reviewCase = (caseId, data) =>
+  api.post(`/cases/${caseId}/review`, data);
+
+// ============================================================================
+// Simulation
+// ============================================================================
+// A simulation writes synthetic transactions, cases, recovery actions and audit
+// events into the same database, and its results are labelled SIMULATED. Large
+// batches take far longer than the default request timeout.
+export const runSimulation = (data = {}) =>
+  api.post('/simulation/run', data, { timeout: 300000 });
 
 // ============================================================================
 // ML
