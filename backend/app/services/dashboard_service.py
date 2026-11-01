@@ -17,6 +17,7 @@ from app.models import (
     AuditEvent,
     CaseStatus,
 )
+from app.services.metrics_service import get_revenue_metrics
 from app.services.value_service import assess_case_value
 from app.utils.logging import logger
 
@@ -107,11 +108,20 @@ def get_dashboard_stats(db: Session) -> Dict[str, Any]:
         RevenueRiskCase.created_at >= seven_days_ago
     ).scalar() or 0
 
+    # Reconciled money view: money-weighted rate with a fixed denominator, the
+    # outstanding balance, the 7-day period comparison, and how much of the
+    # recovered money is webhook-verified rather than simulated.
+    revenue = get_revenue_metrics(db)
+
     return {
         "total_cases": total_cases,
         "total_at_risk": round(total_at_risk, 2),
         "total_recovered": round(total_recovered, 2),
+        # Kept for existing callers: the count-based rate. Its money-weighted
+        # counterpart is ``money_recovery_rate`` and the two are not
+        # interchangeable, so both are returned with explicit names.
         "recovery_rate": round(recovery_rate, 1),
+        **revenue,
         "total_actions": total_actions,
         "successful_actions": successful_actions,
         "failed_actions": failed_actions,

@@ -15,11 +15,11 @@ The **backend is functionally complete** for the simulated story and for a local
 story: 9 routers / 26 endpoints, 8 tables, an ML model, a deterministic policy engine, a
 fail-closed webhook settlement path, value scoring, simulation, a human-review flow that can release
 an `ESCALATED` case, and a dashboard banner that states plainly whether payments are real or mocked.
-`416` automated tests pass. What is still missing is not core logic but
+`435` automated tests pass. What is still missing is not core logic but
 **reach**: (a) no Razorpay Test Mode keys and no public HTTPS URL, so every executed action produces
-a labelled `MOCK` link that cannot be paid and books ₹0; (b) the dashboard's "% recovered" is
-count-based, not money-weighted; (c) nothing runs diagnose → execute without a human click, so the
-threshold-based autonomy the product promises does not exist yet; (d) no auth, no CI, no Docker.
+a labelled `MOCK` link that cannot be paid and books ₹0; (b) nothing runs diagnose → execute without
+a human click, so the threshold autonomy the product promises does not exist yet; (c) no auth, no
+CI, no Docker.
 
 ---
 
@@ -31,7 +31,7 @@ threshold-based autonomy the product promises does not exist yet; (d) no auth, n
 | Endpoints | 26 (`grep -c "@router\." backend/app/api/*.py`) | same |
 | Frontend pages | 6 — `Dashboard`, `Cases`, `CaseDetail`, `AgentMonitor`, `Analytics`, `Policy` (+ `Layout`) | `frontend/src/App.jsx` |
 | DB tables | 8 domain tables — `revenue_risk_cases`, `transactions`, `customers`, `recovery_actions`, `policy_decisions`, `policy_configs`, `audit_events`, `webhook_events` (+ `alembic_version`) | `inspect(engine).get_table_names()` |
-| Tests | **416 passed, 0 failed, 0 skipped, 13 test modules, 5 min 30 s** | `cd backend && ./.venv/Scripts/python.exe -m pytest -q` |
+| Tests | **435 passed, 0 failed, 0 skipped, 14 test modules, 5 min 44 s** | `cd backend && ./.venv/Scripts/python.exe -m pytest -q` |
 | Frontend lint | `oxlint`: **8 warnings, 0 errors** across 11 files | `cd frontend && npx oxlint` |
 | Frontend tests | none (no test runner installed) | — |
 | Migrations | **3**, applied to head `c58e0a4b9f31` — `0267b7bae8a3` initial schema → `b41c9f2a7d10` drop escalation threshold → `c58e0a4b9f31` webhook events | `alembic current` / `alembic heads` |
@@ -64,6 +64,7 @@ data behind them is synthetic and every simulation row carries a `SIMULATED` mar
 | 7 | Webhooks | HMAC-SHA256, **fail-closed** (401 if secret unset or signature bad); durable idempotency ledger (`webhook_events`); only `payment.captured` / `payment_link.paid` settle; only for the exact amount due; settled cases immutable; `payment.authorized` recorded but never settles. | `backend/app/api/webhooks.py` | `test_payment.py` |
 | 8 | Value scoring | Expected gross / intervention cost / net recovery / utility score + candidate ranking. Explicitly advisory — it never authorizes. | `backend/app/services/value_service.py`, `GET /api/cases/{id}/value` | `test_value.py` |
 | 9 | Analytics API | `/dashboard/stats`, 5 chart endpoints, `/audit` (paginated, filter by case/type/actor), `/cases/{id}/detail`. | `backend/app/api/dashboard.py`, `dashboard_service.py` | `test_dashboard.py` |
+| 9c | Money metrics (P3) | `metrics_service.get_revenue_metrics` returns a reconciled money view: `total_case_value` (fixed denominator, face value of every case), `total_recovered`, `outstanding_amount`, `money_recovery_rate`, `count_recovery_rate`, 7-day `recovered_7d` / `at_risk_7d`, the same for the previous 7 days, absolute + percentage deltas (`None` when the previous period was empty), `reconciles`, and a `provenance` split (webhook-`verified` / `simulated` / `unattributed`). Merged into `/dashboard/stats`; old `total_at_risk` and `recovery_rate` unchanged for existing callers. Dashboard shows Money Recovery Rate as the headline with the count-based rate as a labelled secondary figure, a Last 7 Days panel with deltas, and the provenance of recovered money; Analytics uses one fixed denominator for Recovered vs Outstanding. | `backend/app/services/metrics_service.py`, `dashboard_service.py`, `frontend/src/pages/Dashboard.jsx`, `Analytics.jsx` | `test_metrics.py` (19 tests) |
 | 9b | Payment-mode reporting | `GET /api/config/status` returns `mode` (`TEST_MODE` / `MOCK`), `razorpay_configured`, `key_type` (`test`/`live`/`null`) and `webhook_configured` — presence flags only, never a key or secret. `Dashboard` renders it as a banner above the KPI cards: amber `MOCK — no provider call` when unconfigured, blue `TEST MODE` when keys are loaded, with a red line when the webhook secret is missing (settlement impossible) or live keys are detected. | `backend/app/api/health.py`, `frontend/src/pages/Dashboard.jsx`, `frontend/src/services/api.js` | `test_api.py::TestConfigStatusEndpoint` |
 | 10 | UI | 6 pages: KPI cards + charts; filterable case table with a **Simulation card** and a **Review queue**; case detail with diagnosis, timeline, value panel, **AI diagnosis panel**, **Execute panel with action picker**, **Human Review panel**; audit monitor; analytics gauges; policy editor. | `frontend/src/pages/`, `frontend/src/services/api.js` | manual |
 | 11 | Simulation | Synthetic transactions through the whole pipeline with deterministic outcomes, labelled `SIMULATED`. | `backend/app/services/simulation_service.py`, `POST /api/simulation/run` | `test_simulation.py` |
@@ -150,7 +151,7 @@ covers them, but nothing is committed yet.**
 | # | Gap | Impact today | Size |
 |---|---|---|---|
 | G1 | **No Razorpay Test Mode credentials / public webhook URL.** | Every executed action is a `MOCK` link on `mock.invalid`; no payment is possible; `recovered_amount` stays 0. | config |
-| G2 | **Recovery % is count-based only** (`RECOVERED / total × 100`). No money-weighted rate is exposed, and `total_at_risk` *excludes* recovered cases, so Analytics has no fixed denominator. | You cannot read "how much of the ₹ at risk came back" off the dashboard. | S |
+| G2 | ~~Recovery % count-based only~~ **Done (P3):** `money_recovery_rate` with a fixed denominator, `outstanding_amount`, 7-day figures with deltas, provenance split. | Both rates are now reported with distinct names; simulated money is labelled, never folded into a verified figure. | done |
 | G3 | **No autonomy loop.** Policy can approve, but nothing runs diagnose → execute automatically. | Contradicts the threshold-based autonomy the product promises. | M |
 | G4 | No scheduler / background jobs. | No expiry sweep, no automatic reminders, no retry-after-delay (`WAIT_AND_RETRY` is a decision only). | M |
 | G5 | No authentication on mutating endpoints (`/recovery`, `/agent/diagnose`, `/reviews/*`, `PUT /policies`, `/simulation/run`). Single tenant, no user table. | Fine for a local demo; disqualifying if deployed publicly. | L |
@@ -180,20 +181,39 @@ covers them, but nothing is committed yet.**
 Links 2–3 and 5–7 are complete. Link 4 is outside the code. Today links 3→5 are dead because link 3
 produces an unpayable `MOCK` link.
 
-### 6.2 Metric definitions (as implemented, `dashboard_service.get_dashboard_stats`)
+### 6.2 Metric definitions (as implemented in `services/metrics_service.py`)
 
 ```python
-total_at_risk   = SUM(amount)           WHERE status != 'RECOVERED'    # excludes settled money
-total_recovered = SUM(recovered_amount) WHERE recovered_amount > 0
-recovery_rate   = COUNT(status='RECOVERED') / COUNT(cases) * 100      # count-based, 1 dp
+total_case_value      = SUM(amount)                                     # fixed denominator, all cases
+total_recovered       = SUM(recovered_amount) WHERE recovered_amount > 0
+outstanding_amount    = total_case_value - total_recovered
+money_recovery_rate   = total_recovered / total_case_value * 100         # headline, 1 dp
+count_recovery_rate   = COUNT(status='RECOVERED') / COUNT(cases) * 100   # secondary, 1 dp
+recovered_7d          = SUM(recovered_amount) settled in [now-7d, now)   # settlement time = updated_at
+at_risk_7d            = SUM(amount) of cases CREATED in the window, unsettled
+*_previous_7d         = the same two sums over [now-14d, now-7d)
+delta                 = current - previous; delta_pct = None if previous == 0
+provenance            = {verified | simulated | unattributed} amounts + case counts
 ```
 
-Money-weighted rate — not exposed yet, this is G2 — is
-`total_recovered / (total_recovered + total_at_risk)`.
+`total_at_risk` and `recovery_rate` are still returned unchanged for existing callers. The two rates
+answer different questions, so both are named explicitly and shown labelled.
+
+Why `updated_at` is the settlement time: a settled case is immutable (the policy engine refuses every
+further action on it), so its last update is its settlement moment. "At risk in the window" counts
+cases *created* in the window that are still unsettled — money that became at risk during the period
+— not the whole historical book.
+
+Provenance: `verified` requires an `ACTION_EXECUTED` audit event with `actor=webhook` and a
+settling `decision` (`payment.captured` / `payment_link.paid`); `simulated` comes from the settling
+event's `simulation_id` or the `SIM-CASE-` prefix; anything else is `unattributed` and shown as such
+rather than counted as real.
 
 ### 6.3 Why the number does not move today
 
-1. `MOCK` links cannot be paid (no keys) → no webhook → no settlement.
+1. `MOCK` links cannot be paid (no keys) → no webhook → no settlement, so `money_recovery_rate`
+   stays at 87.3 % of case value while `verified` provenance stays at ₹0 (all ₹17,968.32 recovered so
+   far is simulated and labelled as such).
 2. Cases older than the 7-day `case_lifetime_days` are blocked by `CASE_EXPIRY`; two of the three
    simulation runs are already past it.
 3. Simulated recoveries are already booked; re-running simulation only adds synthetic money, it does
@@ -221,12 +241,13 @@ only; the key id, secret and webhook secret are never serialized, asserted in
 a failed status call as non-fatal. Remaining nice-to-have: the same chip on `CaseDetail`'s Execute
 panel, which still only learns the mode from the execute response.
 
-**P3 — Money metrics (S–M).** Add `money_recovery_rate`, `recovered_7d`, `at_risk_7d`,
-`delta_vs_previous_period` to `/dashboard/stats`. Make the money-weighted rate the headline gauge and
-keep the count-based rate as a clearly labelled secondary figure, otherwise "recovery %" means two
-different things on one screen. Fix Analytics so "at risk vs recovered" shares one denominator (face
-value of all cases) and the remainder is labelled "outstanding". Acceptance: the four numbers
-reconcile with each other on the same page.
+**P3 — Money metrics — DONE.** `/dashboard/stats` carries `total_case_value`, `total_recovered`,
+`outstanding_amount`, `money_recovery_rate`, `count_recovery_rate`, `recovered_7d`, `at_risk_7d`,
+both previous-period figures, absolute and percentage deltas, `reconciles`, and the `provenance`
+split. Definitions are documented in `services/metrics_service.py`; the settlement timestamp is
+`updated_at` (valid because a settled case is immutable), and "at risk in the window" means cases
+*created* in the window that are still unsettled. Remaining: expose the deltas as a sparkline rather
+than two numbers.
 
 **P4 — Threshold autonomy (M, the feature the owner actually asked for).** Persist
 `auto_execute_enabled`, `auto_execute_min_confidence`, `auto_execute_max_amount` on `PolicyConfig`

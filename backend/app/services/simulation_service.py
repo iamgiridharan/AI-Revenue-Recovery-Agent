@@ -47,6 +47,10 @@ from app.utils.logging import logger
 # Label for all simulated data
 SIMULATION_LABEL = "SIMULATED"
 
+# Prefix of every case id created by the simulation pipeline. Metrics use it to
+# separate simulated revenue from webhook-verified revenue.
+SIMULATION_CASE_PREFIX = "SIM-CASE-"
+
 # Deterministic recovery outcomes for simulation
 # These are used instead of actual Razorpay calls
 SIMULATED_RECOVERY_OUTCOMES = {
@@ -275,7 +279,7 @@ def run_simulation(
             ml_probs.append(recovery_prob)
 
             # --- Step 4: Create risk case ---
-            case_id_str = f"SIM-CASE-{sim_id}-{idx:06d}"
+            case_id_str = f"{SIMULATION_CASE_PREFIX}{sim_id}-{idx:06d}"
             case = RevenueRiskCase(
                 case_id=case_id_str,
                 transaction_id=transaction.id,

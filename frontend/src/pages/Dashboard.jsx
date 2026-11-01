@@ -50,6 +50,34 @@ function formatCurrency(amount) {
   return '₹' + Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 }
 
+/** Signed change versus the previous 7 days. Null means "no previous period". */
+function Delta({ amount, pct, invert = false }) {
+  if (pct === null || pct === undefined) {
+    return <span className="text-xs text-gray-400">no previous period</span>;
+  }
+  const rising = amount > 0;
+  const good = invert ? !rising : rising;
+  const colour = amount === 0 ? 'text-gray-500' : good ? 'text-green-600' : 'text-red-600';
+  return (
+    <span className={`text-xs font-medium ${colour}`}>
+      {rising ? '+' : ''}{formatCurrency(amount)} ({rising ? '+' : ''}{pct}%)
+    </span>
+  );
+}
+
+/**
+ * Where the recovered money came from. Simulated rupees and webhook-verified
+ * rupees are never added together into a single unlabelled figure.
+ */
+function provenanceSummary(provenance) {
+  if (!provenance) return '';
+  const parts = [];
+  if (provenance.verified?.amount > 0) parts.push(`${formatCurrency(provenance.verified.amount)} webhook-verified`);
+  if (provenance.simulated?.amount > 0) parts.push(`${formatCurrency(provenance.simulated.amount)} simulated`);
+  if (provenance.unattributed?.amount > 0) parts.push(`${formatCurrency(provenance.unattributed.amount)} unattributed`);
+  return parts.join(' \u00b7 ');
+}
+
 /**
  * Says plainly whether executed recovery actions reach Razorpay or are mocked.
  * Without keys every executed action returns a mock.invalid link that cannot be
@@ -190,26 +218,50 @@ export default function Dashboard() {
         <StatCard
           title="Total Cases"
           value={stats.total_cases}
-          subtitle={`${stats.total_customers} customers affected`}
+          subtitle={`${stats.total_customers} customers affected \u00b7 ${stats.awaiting_action} awaiting action`}
         />
         <StatCard
-          title="Revenue at Risk"
-          value={formatCurrency(stats.total_at_risk)}
-          subtitle={`${stats.awaiting_action} awaiting action`}
+          title="Outstanding"
+          value={formatCurrency(stats.outstanding_amount)}
+          subtitle={`of ${formatCurrency(stats.total_case_value)} case value`}
           color="text-red-600"
         />
         <StatCard
-          title="Revenue Recovered"
+          title="Money Recovered"
           value={formatCurrency(stats.total_recovered)}
-          subtitle={`${stats.recovery_rate}% recovery rate`}
+          subtitle={provenanceSummary(stats.provenance) || 'nothing recovered yet'}
           color="text-green-600"
         />
         <StatCard
-          title="Recovery Rate"
-          value={`${stats.recovery_rate}%`}
-          subtitle={`${stats.recovered_count} of ${stats.total_cases} cases`}
+          title="Money Recovery Rate"
+          value={`${stats.money_recovery_rate ?? 0}%`}
+          subtitle={`${stats.recovery_rate}% of cases settled (${stats.recovered_count} of ${stats.total_cases})`}
           color="text-blue-600"
         />
+      </div>
+
+      {/* Last 7 days, with the change against the previous 7 days */}
+      <div className="bg-white rounded-xl border border-gray-200 p-5">
+        <div className="flex items-baseline justify-between mb-3">
+          <h3 className="text-sm font-semibold text-gray-700">Last 7 Days</h3>
+          <span className="text-xs text-gray-400">compared with the previous 7 days</span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="bg-gray-50 rounded-lg p-4">
+            <p className="text-xs font-medium text-gray-500">Recovered</p>
+            <p className="text-xl font-bold text-green-600 mt-1">{formatCurrency(stats.recovered_7d)}</p>
+            <div className="mt-1">
+              <Delta amount={stats.recovered_delta_7d} pct={stats.recovered_delta_pct_7d} />
+            </div>
+          </div>
+          <div className="bg-gray-50 rounded-lg p-4">
+            <p className="text-xs font-medium text-gray-500">New money at risk</p>
+            <p className="text-xl font-bold text-red-600 mt-1">{formatCurrency(stats.at_risk_7d)}</p>
+            <div className="mt-1">
+              <Delta amount={stats.at_risk_delta_7d} pct={stats.at_risk_delta_pct_7d} invert />
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Secondary KPIs */}

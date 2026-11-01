@@ -4,7 +4,7 @@ An AI-powered system that detects failed payments, predicts recovery probability
 
 **Status:** MVP Complete — Recovery Pipeline Verified ✅  
 **Payment Integration:** Razorpay Test Mode ONLY  
-**Latest Verification:** 416 automated tests passing; simulated recovery outcomes, the controlled Test Mode recovery flow (locally executed against a stub provider), the human-review flow, and MOCK-vs-Test-Mode reporting on the dashboard confirmed
+**Latest Verification:** 435 automated tests passing; simulated recovery outcomes, the controlled Test Mode recovery flow (locally executed against a stub provider), the human-review flow, MOCK-vs-Test-Mode reporting, and money-weighted metrics with provenance labelling confirmed
 
 ---
 
@@ -31,7 +31,7 @@ An end-to-end AI agent that:
 The project has been verified end-to-end with the following results:
 
 ### Automated Tests
-- **416 tests passing** across 13 test files
+- **435 tests passing** across 14 test files
 - Coverage includes models, API endpoints, ML pipeline, agent service, policy engine, payment integration, dashboard, simulation, and end-to-end scenarios
 
 ### Simulated Recovery Outcomes
@@ -171,7 +171,7 @@ ai-revenue-recovery-agent/
 │   │   │   ├── dashboard_service.py # Dashboard aggregates
 │   │   │   └── simulation_service.py # Batch simulation
 │   │   └── utils/             # Errors, logging
-│   ├── tests/                 # 13 test files, 416 tests
+│   ├── tests/                 # 14 test files, 435 tests
 │   ├── alembic/               # Database migrations
 │   └── requirements.txt
 ├── frontend/                   # React SPA
@@ -587,14 +587,23 @@ Each simulation produces a realistic distribution of outcomes based on ML predic
 
 ## Business Metrics
 
-| Metric | Formula |
-|--------|---------|
-| Revenue at Risk | SUM(amount) WHERE status != RECOVERED |
-| Revenue Recovered | SUM(recovered_amount) WHERE recovered > 0 |
-| Recovery Rate | Revenue Recovered / Revenue at Risk × 100 |
-| Outstanding Revenue | Revenue at Risk - Revenue Recovered |
-| Escalated Cases | COUNT(status = ESCALATED) |
-| Policy Blocked | COUNT(execution_status = BLOCKED_BY_POLICY) |
+Two recovery rates are reported and they are **not** interchangeable:
+
+| Metric | Formula | Meaning |
+|--------|---------|---------|
+| Case value (fixed denominator) | SUM(amount) over **all** cases | Never moves as statuses change |
+| Money Recovered | SUM(recovered_amount) WHERE recovered_amount > 0 | Rupees actually booked |
+| **Money Recovery Rate** (headline) | Money Recovered / Case value × 100 | How much of the money came back |
+| **Count Recovery Rate** (secondary) | COUNT(status = RECOVERED) / COUNT(cases) × 100 | How many problems were closed |
+| Outstanding | Case value − Money Recovered | Money still to chase |
+| Recovered (7d) / New at risk (7d) | Settled money / value of cases **created** in the window, unsettled | With deltas vs the previous 7 days (`null` when that period was empty) |
+| Recovered provenance | `verified` (signature-verified webhook) · `simulated` · `unattributed` | Simulated and verified rupees are never summed into one unlabelled figure |
+| Escalated Cases | COUNT(status = ESCALATED) | |
+| Policy Blocked | COUNT(execution_status = BLOCKED_BY_POLICY) | |
+
+Implementation: `backend/app/services/metrics_service.py` (`get_revenue_metrics`), merged into
+`GET /api/dashboard/stats`. `total_at_risk` and `recovery_rate` are still returned with their old
+meaning so existing callers keep working.
 
 ---
 
@@ -620,7 +629,7 @@ Each simulation produces a realistic distribution of outcomes based on ML predic
 | PUT | `/api/policies` | Update policy config |
 | POST | `/api/policies/evaluate` | Evaluate action against policy |
 | POST | `/api/webhooks/razorpay` | Razorpay webhook handler |
-| GET | `/api/dashboard/stats` | Dashboard statistics |
+| GET | `/api/dashboard/stats` | Dashboard statistics, both recovery rates, 7-day deltas, provenance |
 | GET | `/api/dashboard/charts/status` | Status chart data |
 | GET | `/api/dashboard/charts/priority` | Priority chart data |
 | GET | `/api/dashboard/charts/actions` | Actions chart data |
@@ -710,7 +719,7 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-**Current status: 416 tests passing across 13 test files.**
+**Current status: 435 tests passing across 14 test files.**
 
 ### Test Files
 
@@ -728,6 +737,7 @@ python -m pytest tests/ -v
 | `test_recovery_execution.py` | Controlled recovery execution, mock vs Test Mode |
 | `test_review.py` | Human review of escalated cases: approve, override, close, refused approvals |
 | `test_value.py` | Value scoring, eligibility, ranking |
+| `test_metrics.py` | Money-weighted vs count rates, 7-day boundaries, duplicate settlement, provenance |
 | `test_e2e_scenarios.py` | Critical end-to-end scenarios |
 
 ### Critical E2E Scenarios

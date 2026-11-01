@@ -94,11 +94,18 @@ export default function Analytics() {
     return entry;
   });
 
-  // Prepare revenue at risk vs recovered
+  // One fixed denominator for the pair: the face value of every case. The two
+  // bars therefore always sum to the total, and "outstanding" cannot drift away
+  // from recovered as case statuses change.
   const revenueComparison = [
-    { name: 'Revenue at Risk', value: stats?.total_at_risk || 0 },
-    { name: 'Revenue Recovered', value: stats?.total_recovered || 0 },
+    { name: 'Recovered', value: stats?.total_recovered || 0 },
+    { name: 'Outstanding', value: stats?.outstanding_amount || 0 },
   ];
+  const totalCaseValue = stats?.total_case_value || 0;
+  const provenanceParts = [];
+  if (stats?.provenance?.verified?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.verified.amount)} webhook-verified`);
+  if (stats?.provenance?.simulated?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.simulated.amount)} simulated`);
+  if (stats?.provenance?.unattributed?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.unattributed.amount)} unattributed`);
 
   return (
     <div className="space-y-6">
@@ -110,7 +117,10 @@ export default function Analytics() {
       {/* Revenue Comparison */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-white rounded-xl border border-gray-200 p-5">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Revenue at Risk vs Recovered</h3>
+          <h3 className="text-sm font-semibold text-gray-700 mb-4">Recovered vs Outstanding</h3>
+          <p className="text-xs text-gray-400 -mt-3 mb-3">
+            Of {formatCurrency(totalCaseValue)} case value — both bars share this denominator
+          </p>
           <ResponsiveContainer width="100%" height={250}>
             <BarChart data={revenueComparison}>
               <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
@@ -118,8 +128,8 @@ export default function Analytics() {
               <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `₹${(v / 1000).toFixed(0)}k`} />
               <Tooltip formatter={(v) => formatCurrency(v)} />
               <Bar dataKey="value" radius={[4, 4, 0, 0]}>
-                <Cell fill="#ef4444" />
                 <Cell fill="#10b981" />
+                <Cell fill="#ef4444" />
               </Bar>
             </BarChart>
           </ResponsiveContainer>
@@ -127,34 +137,42 @@ export default function Analytics() {
 
         <div className="bg-white rounded-xl border border-gray-200 p-5">
           <h3 className="text-sm font-semibold text-gray-700 mb-4">Recovery Rate</h3>
-          <div className="flex items-center justify-center h-[250px]">
+          <p className="text-xs text-gray-400 -mt-3 mb-3">
+            Money-weighted headline — rupees back against all case value
+          </p>
+          <div className="flex items-center justify-center h-[230px]">
             <div className="text-center">
               <div className="relative inline-flex items-center justify-center">
                 <svg className="w-40 h-40" viewBox="0 0 120 120">
                   <circle cx="60" cy="60" r="50" fill="none" stroke="#e5e7eb" strokeWidth="10" />
                   <circle
                     cx="60" cy="60" r="50" fill="none" stroke="#10b981" strokeWidth="10"
-                    strokeDasharray={`${(stats?.recovery_rate || 0) * 3.14} 314`}
+                    strokeDasharray={`${(stats?.money_recovery_rate || 0) * 3.14} 314`}
                     strokeDashoffset="78.5"
                     strokeLinecap="round"
                     transform="rotate(-90 60 60)"
                   />
                 </svg>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  <span className="text-3xl font-bold text-gray-900">{stats?.recovery_rate || 0}%</span>
-                  <span className="text-xs text-gray-500">Recovery Rate</span>
+                  <span className="text-3xl font-bold text-gray-900">{stats?.money_recovery_rate ?? 0}%</span>
+                  <span className="text-[11px] text-gray-500">of ₹ recovered</span>
                 </div>
               </div>
               <div className="mt-4 grid grid-cols-2 gap-4 text-sm">
                 <div>
-                  <p className="text-gray-500">Recovered</p>
-                  <p className="font-bold text-green-600">{stats?.recovered_count || 0}</p>
+                  <p className="text-gray-500">Cases settled</p>
+                  <p className="font-bold text-blue-600">{stats?.recovery_rate || 0}%</p>
+                  <p className="text-[11px] text-gray-400">{stats?.recovered_count || 0} of {stats?.total_cases || 0} cases</p>
                 </div>
                 <div>
-                  <p className="text-gray-500">Total Cases</p>
-                  <p className="font-bold text-gray-900">{stats?.total_cases || 0}</p>
+                  <p className="text-gray-500">Recovered</p>
+                  <p className="font-bold text-green-600">{formatCurrency(stats?.total_recovered)}</p>
+                  <p className="text-[11px] text-gray-400">of {formatCurrency(totalCaseValue)}</p>
                 </div>
               </div>
+              {provenanceParts.length > 0 && (
+                <p className="mt-3 text-[11px] text-gray-400">{provenanceParts.join(' \u00b7 ')}</p>
+              )}
             </div>
           </div>
         </div>
