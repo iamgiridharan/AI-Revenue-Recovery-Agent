@@ -19,6 +19,9 @@ env/
 node_modules/
 frontend/dist/
 
+# Personal notes (local only — never committed)
+docs/
+
 # Tooling / local agent state
 .freebuff/
 .ruff_cache/
