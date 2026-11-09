@@ -1,14 +1,22 @@
-"""
-Human review API endpoints.
+"""Human review API endpoints.
 
 An ESCALATED case is waiting for a human decision: the Policy Engine refused to
 authorize the action on its own, so the case cannot move until a named reviewer
 approves, overrides or closes it.
+
+Protection
+----------
+Both review endpoints require the shared-key bearer token.  A reviewer's name is
+a free-text audit actor (`CaseReviewRequest.reviewer`) - it is the person named
+in the record, not a proof of identity.  The shared key proves the *caller*,
+not the individual being named.
 """
+
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app.core.auth import require_auth
 from app.db.session import get_db
 from app.schemas.review import CaseReviewRequest
 from app.services.review_service import get_review_queue, review_case
@@ -20,25 +28,25 @@ router = APIRouter(tags=["reviews"])
 def review_queue_endpoint(
     limit: int = Query(100, ge=1, le=200, description="Maximum cases to return"),
     db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
 ):
-    """
-    List the escalated cases awaiting human review.
+    """List the escalated cases awaiting human review.
 
-    Each entry carries the policy rule that escalated it and the recorded AI
+    Every entry carries the policy rule that escalated it and the recorded AI
     recommendation, so a reviewer can decide without opening every case.  This
     endpoint is read-only: it makes no decisions.
     """
     return {"success": True, "data": get_review_queue(db, limit=limit)}
 
 
-@router.post("/cases/{case_id}/review", response_model=None)
+@router.post("/cases/{case_id}/review")
 def review_case_endpoint(
     case_id: str,
     request: CaseReviewRequest,
     db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
 ):
-    """
-    Record a named reviewer's decision on an escalated case.
+    """Record a named reviewer's decision on an escalated case.
 
     - ``APPROVE`` executes the recorded AI recommendation. The Policy Engine is
       re-run with the reviewer named as the authorizing human, so the autonomy
@@ -73,8 +81,6 @@ def review_case_endpoint(
     status_code = result.pop("http_status", 400)
     payload = {"success": False, "error": {"code": result["code"],
                                            "message": result["error"]}}
-    # Carry the review context through on refusals too: the caller needs to know
-    # the decision was recorded and what the case status is now.
     payload.update({key: value for key, value in result.items()
                     if key not in ("success", "code", "error")})
     return JSONResponse(status_code=status_code, content=payload)

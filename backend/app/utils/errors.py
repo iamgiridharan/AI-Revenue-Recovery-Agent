@@ -43,16 +43,25 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
 
 
 async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    """Handle FastAPI HTTP exceptions."""
+    """Handle FastAPI HTTP exceptions with the shared error envelope.
+
+    ``detail`` may already be a structured payload (the authentication dependency
+    raises ``{"error": ..., "message": ...}``).  Merge it rather than nesting it,
+    so every error response has the same ``success`` / ``error`` shape and no
+    stack trace or internal value is exposed.
+    """
     logger.warning(f"HTTPException: {exc.detail} | Path: {request.url.path}")
+
+    detail = exc.detail
+    if isinstance(detail, dict):
+        error = {"message": detail.get("message", "Request failed"), **detail}
+    else:
+        error = {"message": detail}
+
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "success": False,
-            "error": {
-                "message": exc.detail,
-            },
-        },
+        headers=getattr(exc, "headers", None) or None,
+        content={"success": False, "error": error},
     )
 
 

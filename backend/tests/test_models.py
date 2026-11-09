@@ -59,7 +59,8 @@ class TestEnums:
             "CASE_CREATED", "CASE_UPDATED", "RISK_ASSESSED",
             "DIAGNOSIS_COMPLETED", "ACTION_RECOMMENDED",
             "POLICY_CHECKED", "ACTION_EXECUTED", "ACTION_FAILED",
-            "CASE_ESCALATED", "CASE_CLOSED", "HUMAN_REVIEW_COMPLETED"
+            "CASE_ESCALATED", "CASE_CLOSED", "HUMAN_REVIEW_COMPLETED",
+            "POLICY_CONFIG_CHANGED"
         }
         actual = {e.value for e in AuditEventType}
         assert actual == expected

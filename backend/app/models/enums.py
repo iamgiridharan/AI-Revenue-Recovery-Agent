@@ -63,6 +63,8 @@ class AuditEventType(str, enum.Enum):
     CASE_ESCALATED = "CASE_ESCALATED"
     CASE_CLOSED = "CASE_CLOSED"
     HUMAN_REVIEW_COMPLETED = "HUMAN_REVIEW_COMPLETED"
+    # Durable record of a policy configuration change (actor demo_api_key).
+    POLICY_CONFIG_CHANGED = "POLICY_CONFIG_CHANGED"
 
 
 class PolicyDecisionType(str, enum.Enum):

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from app.core.auth import require_auth
 from app.db.session import get_db
 from app.services.case_service import get_cases, get_case_by_id
 from app.services.value_service import assess_case_value_by_id
@@ -120,6 +121,7 @@ def execute_case_recovery(
     case_id: str,
     request: RecoveryExecutionRequest | None = Body(None),
     db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
 ):
     """
     Execute an approved recovery action for a case (Phase 4: Test Mode).

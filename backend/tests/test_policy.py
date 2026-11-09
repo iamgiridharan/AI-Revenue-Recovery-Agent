@@ -1147,7 +1147,8 @@ class TestEscalationThresholdRemoved:
         response = client.put("/api/policies", json={"escalation_threshold": 0.5})
 
         assert response.status_code == 400
-        assert "No fields to update" in response.json()["detail"]
+        # One consistent error envelope: {"success": false, "error": {...}}.
+        assert "No fields to update" in response.json()["error"]["message"]
 
         assert "escalation_threshold" not in client.get("/api/policies").json()
 

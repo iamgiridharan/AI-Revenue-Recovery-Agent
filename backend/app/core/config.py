@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
+    # Demonstration authentication (shared secret, one key, one actor).
+    # Unauthenticated access is refused (401); an unset key refuses with 503.
+    # The value is never logged or audited.
+    DEMO_API_KEY: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

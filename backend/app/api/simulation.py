@@ -9,6 +9,7 @@ No real Razorpay API calls are made during simulation.
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.core.auth import require_auth
 from app.db.session import get_db
 from app.schemas.simulation import SimulationRequest, SimulationResult
 from app.services.simulation_service import run_simulation
@@ -21,6 +22,7 @@ router = APIRouter(tags=["simulation"])
 def run_simulation_endpoint(
     request: SimulationRequest,
     db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
 ):
     """
     Run a batch simulation of synthetic payment failures and recovery attempts.

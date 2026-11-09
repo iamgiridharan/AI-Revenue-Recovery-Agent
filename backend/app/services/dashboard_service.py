@@ -9,6 +9,28 @@ from sqlalchemy import func, case, extract
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List
 
+def mask_email(email: str | None) -> str:
+    """Hide the local-part of an email address. Kept readable enough for the
+    dashboard while making the address unsuitable for outbound identity."""
+    if not email:
+        return ""
+    local, _, domain = email.partition("@")
+    if len(local) <= 2:
+        return local + "***@" + domain
+    return local[0] + "*" * (len(local) - 2) + local[-1] + "@" + domain
+
+
+def mask_phone(phone: str | None) -> str:
+    """Show the first 4 digits and last 4 digits of a phone number."""
+    if not phone:
+        return ""
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) <= 8:
+        return digits
+    return digits[:4] + "****" + digits[-4:]
+
+
+
 from app.models import (
     RevenueRiskCase,
     Transaction,
@@ -228,8 +250,8 @@ def get_case_detail_with_relations(db: Session, case_id: str) -> Dict[str, Any]:
             "id": customer.id,
             "customer_id": customer.customer_id,
             "name": customer.name,
-            "email": customer.email,
-            "phone": customer.phone,
+            "email": mask_email(customer.email),
+            "phone": mask_phone(customer.phone),
             "total_transactions": customer.total_transactions,
             "successful_transactions": customer.successful_transactions,
             "failed_transactions": customer.failed_transactions,

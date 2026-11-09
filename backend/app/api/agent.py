@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from app.core.auth import require_auth
 from app.db.session import get_db
 from app.schemas.agent import AgentDiagnosisRequest
 from app.services.agent_service import diagnose_case
@@ -22,6 +23,7 @@ router = APIRouter(tags=["agent"])
 def diagnose_case_endpoint(
     request: AgentDiagnosisRequest,
     db: Session = Depends(get_db),
+    _auth: str = Depends(require_auth),
 ):
     """
     Diagnose a revenue risk case using AI agent.

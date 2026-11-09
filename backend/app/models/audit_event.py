@@ -11,7 +11,9 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    case_id = Column(Integer, ForeignKey("revenue_risk_cases.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Nullable: events that are not about a specific case (e.g. a policy
+    # configuration change) still belong in the durable audit trail.
+    case_id = Column(Integer, ForeignKey("revenue_risk_cases.id", ondelete="CASCADE"), nullable=True, index=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
     event_type = Column(String(50), nullable=False, index=True)  # From AuditEventType enum
     actor = Column(String(100), nullable=False)  # Who/what performed the action (e.g., "ai_agent", "policy_engine", "user")

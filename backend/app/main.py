@@ -1,9 +1,11 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from app.core.config import get_settings
+from app.core.rate_limit import rate_limit_middleware
 from app.api.health import router as health_router
 from app.api.cases import router as cases_router
 from app.api.ml import router as ml_router
@@ -16,8 +18,8 @@ from app.api.reviews import router as reviews_router
 from app.utils.errors import (
     AppError,
     app_error_handler,
-    http_error_handler,
     generic_error_handler,
+    http_error_handler,
 )
 from app.utils.logging import logger
 
@@ -49,8 +51,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Error handlers
+# In-memory throttling for the sensitive routes.  The Razorpay webhook endpoint is
+# exempt inside the middleware, so provider retries are never throttled.
+app.middleware("http")(rate_limit_middleware)
+
+# Error handlers -- one consistent envelope, and no stack traces or internals
+# leaked to the caller (the generic handler logs the detail server-side only).
 app.add_exception_handler(AppError, app_error_handler)
+app.add_exception_handler(HTTPException, http_error_handler)
 app.add_exception_handler(Exception, generic_error_handler)
 
 # Routers
@@ -63,4 +71,3 @@ app.include_router(webhooks_router, prefix="/api")
 app.include_router(dashboard_router, prefix="/api")
 app.include_router(simulation_router, prefix="/api")
 app.include_router(reviews_router, prefix="/api")
-

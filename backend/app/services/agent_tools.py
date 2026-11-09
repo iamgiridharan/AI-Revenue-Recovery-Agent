@@ -264,7 +264,23 @@ def escalate_case(
     case = db.query(RevenueRiskCase).filter(RevenueRiskCase.case_id == case_id).first()
     if not case:
         return {"success": False, "error": f"Case {case_id} not found"}
-    
+
+    # Terminal states are final: a recovered case has settled money that must not
+    # be relabelled as escalated, and a closed case has already been resolved by a
+    # human.  Escalating either would reopen a finished decision.
+    if case.status in (CaseStatus.RECOVERED.value, CaseStatus.CLOSED.value):
+        logger.warning(
+            f"Refusing to escalate terminal case {case_id} (status {case.status})"
+        )
+        return {
+            "success": False,
+            "case_id": case_id,
+            "status": case.status,
+            "error": (
+                f"Case {case_id} is {case.status}; a terminal case cannot be escalated"
+            ),
+        }
+
     # Update case status
     case.status = CaseStatus.ESCALATED.value
     db.commit()

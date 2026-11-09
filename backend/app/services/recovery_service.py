@@ -637,9 +637,12 @@ def process_payment_success(
             "recovered_amount": case.recovered_amount,
         }
 
-    # Update case
+    # Update case.  The recovered figure is the case's own amount (the amount
+    # that was due and has just been verified), not the caller-supplied webhook
+    # value: the two are equal inside the tolerance checked above, but only the
+    # transaction-derived figure is authoritative.
     case.status = CaseStatus.RECOVERED.value
-    case.recovered_amount = amount
+    case.recovered_amount = case.amount
     
     # Create audit event
     audit_event = AuditEvent(
@@ -652,20 +655,21 @@ def process_payment_success(
         result="SUCCESS",
         metadata_={
             "payment_id": payment_id,
-            "amount": amount,
+            "amount": case.recovered_amount,
+            "captured_amount": amount,
         },
     )
     db.add(audit_event)
     
     db.commit()
     
-    logger.info(f"Case {case_id} marked as recovered, amount: {amount}")
+    logger.info(f"Case {case_id} marked as recovered, amount: {case.recovered_amount}")
     
     return {
         "success": True,
         "case_id": case_id,
         "status": "RECOVERED",
-        "recovered_amount": amount,
+        "recovered_amount": case.recovered_amount,
     }
 
 
