@@ -886,6 +886,132 @@ python -m pytest tests/ -v
 
 ---
 
+
+## Operational Security & Backup
+
+### Demonstration authentication
+
+Mutating endpoints (`agent/diagnose`, `cases/{id}/recovery`, `cases/{id}/review`,
+`policies`, `simulation/run`) require a shared secret bearer token:
+
+- Provide it in `backend/.env` as ``DEMO_API_KEY`` (the backend reads `.env`
+  automatically).
+- Callers send it as ``X-API-Key: <DEMO_API_KEY>``.
+- Missing or invalid key -> HTTP 401. Missing/unset key -> HTTP 503 on protected
+  routes.
+- Webhook deliveries (`/api/webhooks/razorpay`) are **not** key-authenticated;
+  they rely on their own HMAC-SHA256 signature, which fails closed.
+- The key never leaves the server: it is never logged, never stored in an
+  audit event, and never returned to a client. Audit records record the fixed
+  identity `demo_api_key`.
+
+To use it from the UI, the same value must be present in both files:
+
+```bash
+# backend/.env
+DEMO_API_KEY=<generated-value>
+
+# frontend/.env.local  (compiled into the browser bundle - NOT a secret)
+VITE_DEMO_API_KEY=<generated-value>
+```
+
+**Important:** this is a single-shared-secret demo mechanism, not a security
+boundary. The key ships in the browser bundle when the frontend reads it from a
+Vite `.env.local` file, so anyone with page source can extract it.
+
+### Rate limiting
+
+Sensitive routes are throttled in memory:
+
+| Route | Limit |
+|-------|-------|
+| `agent/diagnose` | 10 requests / 60s |
+| `cases/{id}/recovery` | 10 requests / 60s |
+| `cases/{id}/review` | 10 requests / 60s |
+| `policies` | 10 requests / 60s |
+| `policies/evaluate` | 10 requests / 60s |
+| `simulation/run` | 10 requests / 60s |
+
+The webhook route is exempt so provider retries can never be throttled into a
+missed settlement. **Limitation:** in-memory counters vanish on restart and count
+per-process, not per-host. For a single-instance demonstration this is sufficient;
+production deployments should mount a shared store (e.g. Redis).
+
+### Policy-change audit
+
+Every successful `PUT /api/policies` writes a `POLICY_CONFIG_CHANGED` audit event
+recording the authenticated actor (`demo_api_key`), the previous values, the new
+values, the changed fields and the timestamp. The configuration write and its
+audit event commit in **one** transaction, so a failed change leaves neither
+behind. Policy events are not attached to a case, so `audit_events.case_id` is
+nullable (Alembic revision `d4a7c1e9b3f2`).
+
+### PostgreSQL backup and restore
+
+The database is PostgreSQL; the schema is managed by Alembic migrations under
+`backend/alembic/versions/`. To keep a safe, recent backup for restore:
+
+Always dump **before** running a migration. `pg_dump` needs `-d <dbname>`:
+without it, PostgreSQL dumps the `postgres` maintenance database instead and
+produces a near-empty archive (a few KB), which is the usual silent backup
+failure.
+
+```bash
+# 1) Dump the live database to a custom-format archive
+pg_dump -h <host> -U <user> -d revenue_recovery -F c -f backup_$(date +%F_%H%M%S).dump
+
+# 2) Prove the archive is real: it must list the application tables and
+#    a TABLE DATA entry for each. A tiny file or a "dbname: postgres" header
+#    means the dump is useless.
+pg_restore -l backup_2026-11-09_230000.dump | head -5   # dbname: revenue_recovery
+pg_restore -l backup_2026-11-09_230000.dump | grep -c 'TABLE DATA'   # expect 9
+
+# 3) Restore into a throwaway database for verification
+createdb -h <host> -U <user> restore_test
+pg_restore -h <host> -U <user> --no-owner --no-privileges \
+    -d restore_test backup_2026-11-09_230000.dump
+
+# 4) Compare the copy against the live database (table names are plural)
+psql -h <host> -U <user> -d restore_test -c "
+  SELECT 'customers', count(*) FROM customers
+  UNION ALL SELECT 'transactions', count(*) FROM transactions
+  UNION ALL SELECT 'revenue_risk_cases', count(*) FROM revenue_risk_cases
+  UNION ALL SELECT 'audit_events', count(*) FROM audit_events;";
+```
+
+Notes:
+
+- Create the restore target as a **new empty** database (`createdb restore_test`).
+  Do not use `createdb -T revenue_recovery`: PostgreSQL refuses to use a live
+  database as a template while it has connections, and restoring into it would
+  overwrite the original.
+- Use `--no-owner --no-privileges` so the restore does not depend on the same
+  roles existing on the target server.
+- A dump contains customer data. Keep it out of the repository (`.gitignore`
+  excludes `*.dump`) and off shared drives, and encrypt or delete it once the
+  verification is done.
+- The `.env` file is git-ignored and contains `DATABASE_URL`, which embeds the
+  role/password. Never commit it, never paste it into chat or screenshots, and
+  rotate the database password periodically.
+- Migrations are applied with `cd backend && alembic upgrade head`. To roll back
+  one step: `alembic downgrade -1` (only on a copy of the data).
+- Verify a restore by comparing row counts of the key tables (`customers`,
+  `transactions`, `revenue_risk_cases`, `audit_events`) and the sums of
+  `revenue_risk_cases.amount` / `recovered_amount` against the live database
+  before pointing the application at the restored instance. Because the dump
+  includes `alembic_version`, the restored copy reports the same revision it was
+  taken at; run `alembic upgrade head` on it if it should match a newer schema.
+
+### Key hygiene checklist
+
+- [ ] `DEMO_API_KEY` set in `backend/.env` for any demo that needs mutating reads.
+- [ ] Never commit `backend/.env`, `*.db`, `*.dump`, or any credential file.
+- [ ] Rotate the database password periodically and do not share it in logs.
+- [ ] Keep `RAZORPAY_WEBHOOK_SECRET` private; it is the only key that *must* be
+       known to both this server and Razorpay's webhook endpoint.
+- [ ] Confirm the dashboard banner shows `MOCK` (no key) or `TEST MODE`
+       (credentials + webhook secret configured) before any payment claim.
+
 ## License
 
 This is an MVP project for demonstration purposes.

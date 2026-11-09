@@ -48,6 +48,11 @@ htmlcov/
 *.db-journal
 *.sqlite
 *.sqlite3
+*.dump
+*.backup
 
 # Logs
 *.log
+
+# Local migration verification workspace (never committed)
+backend/.tmp_verify/

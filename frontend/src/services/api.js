@@ -8,6 +8,16 @@ const api = axios.create({
   },
 });
 
+// Shared demonstration key for the mutating endpoints (diagnose, recovery, review,
+// policy, simulation). IMPORTANT: Vite bakes VITE_* values into the browser
+// bundle, so this is NOT a secret -- anyone can read it from the page source.
+// It is a local academic-demo convenience only. A public deployment must
+// terminate authentication at the backend or a reverse proxy.
+const demoApiKey = import.meta.env.VITE_DEMO_API_KEY;
+if (demoApiKey) {
+  api.defaults.headers.common['X-API-Key'] = demoApiKey;
+}
+
 // Turn a FastAPI error payload into a message a human can act on.
 // Validation failures arrive as `detail: [{ loc, msg, type }]`; passing that
 // array to `new Error()` produced the useless "[object Object]" banner.
@@ -43,10 +53,34 @@ export function formatErrorMessage(error) {
   return error.message || 'An unexpected error occurred';
 }
 
+// Authentication failures are the one error class this browser cannot fix on its
+// own: the server rejects the request before it reaches any business logic, and the
+// remedy is always a configuration value, not a retry. The backend's message says
+// what it saw (a missing header, a wrong key); append where that value comes from so
+// the banner tells the reader what to change. Only the variable names are added --
+// never the key values themselves.
+function authHint(status) {
+  if (status === 503) {
+    return 'Restart the API after setting it.';
+  }
+  if (status === 401) {
+    return demoApiKey
+      ? "VITE_DEMO_API_KEY in frontend/.env.local does not match this server's DEMO_API_KEY; correct it and restart the dev server."
+      : 'This frontend was built without VITE_DEMO_API_KEY; set it in frontend/.env.local to match the server\'s DEMO_API_KEY and restart the dev server.';
+  }
+  return '';
+}
+
+function formatWithAuthContext(error) {
+  const message = formatErrorMessage(error);
+  const hint = authHint(error.response?.status);
+  return hint ? `${message} ${hint}` : message;
+}
+
 // Response interceptor for error handling
 api.interceptors.response.use(
   (response) => response.data,
-  (error) => Promise.reject(new Error(formatErrorMessage(error)))
+  (error) => Promise.reject(new Error(formatWithAuthContext(error)))
 );
 
 // ============================================================================

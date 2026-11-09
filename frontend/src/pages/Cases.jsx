@@ -201,14 +201,21 @@ function SimulationPanel({ onSimulated }) {
 
               {Object.keys(result.recovery_action_breakdown || {}).length > 0 && (
                 <div className="flex flex-wrap gap-2">
-                  {Object.entries(result.recovery_action_breakdown).map(([action, count]) => (
-                    <span
-                      key={action}
-                      className="text-[11px] px-2 py-0.5 rounded bg-gray-50 border border-gray-200 text-gray-600"
-                    >
-                      {action.replace(/_/g, ' ')}: {count}
-                    </span>
-                  ))}
+                  {/* Each entry is {success, failed}, not a plain count: rendering the
+                      object directly crashes the whole page after a successful run. */}
+                  {Object.entries(result.recovery_action_breakdown).map(([action, outcome]) => {
+                    const success = typeof outcome === 'number' ? outcome : (outcome?.success ?? 0);
+                    const failed = typeof outcome === 'number' ? 0 : (outcome?.failed ?? 0);
+                    return (
+                      <span
+                        key={action}
+                        className="text-[11px] px-2 py-0.5 rounded bg-gray-50 border border-gray-200 text-gray-600"
+                      >
+                        {action.replace(/_/g, ' ')}: {success} succeeded
+                        {failed > 0 ? `, ${failed} failed` : ''}
+                      </span>
+                    );
+                  })}
                 </div>
               )}
 
