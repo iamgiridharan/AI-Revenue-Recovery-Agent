@@ -13,6 +13,7 @@ Covered here:
   budget) still refuses, the case stays ESCALATED and the refusal is recorded
 - the request can never supply the amount or the confidence
 """
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -596,3 +597,124 @@ class TestReviewQueue:
         _escalated_case(db_session, customer, transaction)
         client.get("/api/reviews/queue")
         assert _refresh_case(db_session).status == "ESCALATED"
+
+
+# ============================================================================
+# A human approval cannot produce a link from an unusable provider
+# ============================================================================
+
+
+class TestProviderRefusal:
+    """
+    Approval authorizes execution; it does not make a provider reachable.
+
+    Test Mode credentials without a usable client are refused here too, with the
+    same 503 the recovery endpoint returns, and no mock link is substituted.
+    """
+
+    def test_approval_is_refused_when_test_mode_has_no_client(
+        self, client, db_session, active_policy, customer, transaction, monkeypatch
+    ):
+        _escalated_case(db_session, customer, transaction)
+
+        from types import SimpleNamespace
+        from app.services import razorpay_service
+
+        # Test Mode credentials with no usable provider client (the suite-wide
+        # "no client" stub stays in place), so the provider cannot be reached.
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="rzp_test_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+
+        response = client.post(f"/api/cases/{CASE_ID}/review", json={
+            "reviewer": "Asha Reviewer",
+            "decision": "APPROVE",
+            "note": "Approved, but the provider is not reachable",
+        })
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "PAYMENT_PROVIDER_UNAVAILABLE"
+        assert "mode: TEST_MODE" in payload["error"]["message"]
+        assert payload["reviewed"] is True
+        body = json.dumps(payload)
+        assert "plink_" not in body
+        assert "mock.invalid" not in body
+        assert "super-secret-value" not in body
+
+        # The review already moved the case to IN_PROGRESS before executing (the
+        # same as any failed execution after approval), but nothing was recovered
+        # and only a refusal was recorded.
+        stored = _refresh_case(db_session)
+        assert stored.status == "IN_PROGRESS"
+        assert stored.attempt_count == 0
+        assert stored.recovered_amount == 0.0
+        actions = (
+            db_session.query(RecoveryAction)
+            .filter(RecoveryAction.case_id == stored.id)
+            .all()
+        )
+        assert [a.execution_status for a in actions] == ["REFUSED"]
+        assert actions[0].api_reference is None
+
+
+# ============================================================================
+# A human approval cannot make a reminder deliverable
+# ============================================================================
+
+
+class TestReminderUnavailable:
+    """
+    A human approval cannot make an undeliverable reminder executable.
+
+    No delivery channel exists, so the Policy Engine refuses the action and the
+    review is recorded as a refusal: the case stays ESCALATED, nothing is
+    recorded as sent, and no attempt is charged.
+    """
+
+    def test_approved_reminder_is_refused_as_unavailable(
+        self, client, db_session, active_policy, customer, transaction
+    ):
+        case = _make_case(db_session, customer, transaction)
+        _record_diagnosis(db_session, case, action="SEND_PAYMENT_REMINDER")
+        _record_escalation(db_session, case, action="SEND_PAYMENT_REMINDER")
+
+        response = client.post(f"/api/cases/{CASE_ID}/review", json={
+            "reviewer": "Asha Reviewer",
+            "decision": "APPROVE",
+            "note": "Approved for a reminder",
+        })
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "POLICY_BLOCKED"
+        assert "not executable in this deployment" in payload["error"]["message"]
+        assert payload["policy_decision"]["code"] == "ACTION_UNAVAILABLE"
+        assert payload["action_availability"]["availability"] == "SIMULATED_ONLY"
+        assert payload["action_availability"]["executable"] is False
+
+        # The case stays escalated: an approval cannot supply a missing integration.
+        stored = _refresh_case(db_session)
+        assert stored.status == "ESCALATED"
+        assert stored.recovered_amount == 0.0
+        assert db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == stored.id
+        ).count() == 0
+
+        # The refusal is recorded against the reviewer.
+        review = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == stored.id,
+            AuditEvent.event_type == "HUMAN_REVIEW_COMPLETED",
+        ).one()
+        assert review.decision == "REJECTED_BY_POLICY"
+        assert review.actor == "Asha Reviewer"
+        assert review.metadata_["review_decision"] == "APPROVE"

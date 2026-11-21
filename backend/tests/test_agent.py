@@ -315,30 +315,106 @@ class TestAgentTools:
         result = get_recovery_probability(db_session, "NONEXISTENT")
         assert result is None
 
-    def test_create_payment_link_mock(self, db_session):
-        """Test create_payment_link mock tool."""
+    def test_create_payment_link_tool_refuses_to_produce_a_link(self, db_session):
+        """
+        The agent tool cannot create a payment link, mock or real.
+
+        Recovery links exist only after the Policy Engine authorizes the stored
+        recommendation, so this tool must return no link at all and must never
+        reach the provider layer.
+        """
+        with patch("app.services.razorpay_service.create_payment_link") as provider_call:
+            result = create_payment_link(db_session, "CASE-001", 2500.0)
+
+        provider_call.assert_not_called()
+        assert result["success"] is False
+        assert result["code"] == "POLICY_AUTHORIZATION_REQUIRED"
+        assert "payment_link" not in result
+        assert "mock.invalid" not in str(result)
+        assert result["execution_mode"] == "NOT_EXECUTED"
+        assert result["action_executed"] is False
+        assert result["provider_called"] is False
+        assert result["mock"] is False
+
+    def test_create_payment_link_tool_does_not_touch_the_case(
+        self, db_session, sample_case
+    ):
+        """A refusal must not record an execution or move the case."""
         result = create_payment_link(db_session, "CASE-001", 2500.0)
-        assert result["success"] is True
-        assert "payment_link" in result
-        assert result["mock"] is True
 
-    def test_send_payment_reminder_mock(self, db_session):
-        """Test send_payment_reminder mock tool."""
+        assert result["success"] is False
+        db_session.refresh(sample_case)
+        assert sample_case.status == CaseStatus.OPEN.value
+        assert sample_case.attempt_count == 1
+        assert sample_case.recovered_amount == 0.0
+        assert db_session.query(RecoveryAction).count() == 0
+        assert db_session.query(AuditEvent).count() == 0
+
+    def test_send_payment_reminder_tool_never_claims_delivery(self, db_session):
+        """
+        Regression (2A): no delivery channel exists, so the reminder tool must not
+        report a sent reminder.  It previously returned success: True with
+        "Payment reminder sent successfully".
+        """
         result = send_payment_reminder(db_session, "CASE-001", "test@example.com")
-        assert result["success"] is True
-        assert result["mock"] is True
 
-    def test_retry_payment_mock(self, db_session):
-        """Test retry_payment mock tool."""
+        assert result["success"] is False
+        assert result["code"] == "ACTION_UNAVAILABLE"
+        assert result["availability"]["availability"] == "SIMULATED_ONLY"
+        assert result["availability"]["executable"] is False
+        assert result["delivery_status"] == "NOT_SENT"
+        assert result["delivered"] is False
+        assert result["provider_called"] is False
+        assert result["action_executed"] is False
+        assert result["mock"] is False
+        assert "sent successfully" not in str(result).lower()
+
+    def test_send_payment_reminder_tool_records_nothing(
+        self, db_session, sample_case
+    ):
+        """A refused reminder must not create an action or an audit event."""
+        send_payment_reminder(db_session, "CASE-001", "test@example.com")
+
+        assert db_session.query(RecoveryAction).count() == 0
+        assert db_session.query(AuditEvent).count() == 0
+        db_session.refresh(sample_case)
+        assert sample_case.status == CaseStatus.OPEN.value
+
+    def test_retry_payment_tool_never_claims_a_retry(self, db_session):
+        """
+        Regression (2A): a retry creates a payment link, so it may only happen
+        through the policy-authorized execution path.  The tool previously returned
+        success: True with "Payment retry initiated".
+        """
         result = retry_payment(db_session, "CASE-001", "card")
-        assert result["success"] is True
-        assert result["mock"] is True
 
-    def test_check_recovery_status_mock(self, db_session):
-        """Test check_recovery_status mock tool."""
+        assert result["success"] is False
+        assert result["code"] == "POLICY_AUTHORIZATION_REQUIRED"
+        assert result["execution_mode"] == "NOT_EXECUTED"
+        assert result["action_executed"] is False
+        assert result["provider_called"] is False
+        assert result["mock"] is False
+        assert "initiated" not in str(result).lower()
+
+    def test_check_recovery_status_reads_the_database(
+        self, db_session, sample_case
+    ):
+        """The status lookup reports the stored status, not a fabricated one."""
         result = check_recovery_status(db_session, "CASE-001")
+
+        assert result["success"] is True
         assert result["case_id"] == "CASE-001"
-        assert result["mock"] is True
+        assert result["status"] == CaseStatus.OPEN.value
+        assert result["source"] == "database"
+        assert result["mock"] is False
+
+    def test_check_recovery_status_missing_case(self, db_session):
+        """A missing case is reported as missing instead of given a status."""
+        result = check_recovery_status(db_session, "NONEXISTENT")
+
+        assert result["success"] is False
+        assert result["code"] == "CASE_NOT_FOUND"
+        assert "status" not in result
 
     def test_record_audit_event(self, db_session, sample_case):
         """Test record_audit_event tool."""
@@ -465,6 +541,172 @@ class TestAgentService:
         assert sample_case.diagnosis is not None
         assert sample_case.recommended_action is not None
 
+    def test_diagnosis_is_labelled_deterministic(self, db_session, sample_case):
+        """
+        Regression (2B): the diagnosis is produced by rules, and the response says
+        so instead of presenting it as a language-model answer.
+        """
+        result = diagnose_case(db_session, "CASE-001")
+
+        assert result["success"] is True
+        assert result["llm_used"] is False
+        assert result["diagnosis_source"] == "DETERMINISTIC_RULES"
+        assert result["model_used"] == "deterministic-rules-v1"
+        assert result["model_used"] != "mock-llm-v1"
+        assert result["confidence_source"] == "deterministic_rule_score"
+        assert result["recovery_probability_source"] == "ml_model_case_level"
+
+        # The probability is the ML value stored on the case, not a constant.
+        assert result["data"]["recovery_probability"] == 0.65
+        assert result["recovery_probability_used"] == 0.65
+
+        # The diagnosis is built from the stored failure reason, and contains no
+        # invented statistics (the old text claimed an "85% success rate").
+        assert "insufficient" in result["data"]["diagnosis"].lower()
+        assert "85%" not in result["data"]["diagnosis"]
+        assert "rule-based" in result["data"]["diagnosis"].lower()
+
+    def test_diagnosis_provenance_is_recorded_in_the_audit_event(
+        self, db_session, sample_case
+    ):
+        """The audit trail states what produced the diagnosis and which value was used."""
+        diagnose_case(db_session, "CASE-001")
+
+        event = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == sample_case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+        ).one()
+        metadata = event.metadata_
+        assert metadata["diagnosis_source"] == "DETERMINISTIC_RULES"
+        assert metadata["llm_used"] is False
+        assert metadata["confidence_source"] == "deterministic_rule_score"
+        assert metadata["recovery_probability"] == 0.65
+        assert metadata["recovery_probability_source"] == "ml_model_case_level"
+
+    def test_policy_uses_the_ml_probability_not_the_engines_claim(
+        self, db_session, sample_case
+    ):
+        """
+        A diagnosis engine cannot raise the probability that authorizes spending:
+        the Policy Engine is given the ML value stored on the case.
+        """
+        inflated = {
+            "diagnosis": "Rule output claiming a very high probability",
+            "reasoning_summary": "This recommendation claims 0.99 to test sourcing",
+            "recovery_probability": 0.99,
+            "recommended_action": "CREATE_PAYMENT_LINK",
+            "confidence": 0.9,
+            "customer_message": "Please retry your payment using this link.",
+            "additional_information_required": False,
+        }
+        with patch("app.services.agent_service.call_llm", return_value=inflated):
+            result = diagnose_case(db_session, "CASE-001")
+
+        assert result["success"] is True
+        assert result["recovery_probability_used"] == 0.65
+
+        event = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == sample_case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+        ).one()
+        assert event.metadata_["recovery_probability"] == 0.65
+        assert event.metadata_["model_reported_recovery_probability"] == 0.99
+
+    def test_missing_ml_probability_escalates_instead_of_inventing_one(
+        self, db_session, sample_case
+    ):
+        """
+        Regression (2B): without a stored ML probability the case is escalated. The
+        old mock answered every case with 0.82.
+        """
+        sample_case.recovery_probability = None
+        db_session.commit()
+
+        result = diagnose_case(db_session, "CASE-001")
+
+        assert result["success"] is False
+        assert result["code"] == "RECOVERY_PROBABILITY_UNAVAILABLE"
+        assert result["fallback_action"] == "ESCALATE_TO_HUMAN"
+        assert "fallback_reason" in result
+
+        db_session.refresh(sample_case)
+        assert sample_case.status == CaseStatus.ESCALATED.value
+        assert sample_case.diagnosis is None
+
+        diagnoses = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == sample_case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+        ).all()
+        assert len(diagnoses) == 1
+        assert diagnoses[0].decision == "FALLBACK"
+        assert diagnoses[0].confidence is None
+
+    def test_unknown_failure_reason_escalates(self, db_session, sample_case):
+        """An unrecognised failure cause is escalated, never guessed."""
+        from app.models import Transaction as TransactionModel
+
+        txn = db_session.query(TransactionModel).filter(
+            TransactionModel.id == sample_case.transaction_id
+        ).one()
+        txn.failure_reason = "something_unheard_of"
+        db_session.commit()
+
+        result = diagnose_case(db_session, "CASE-001")
+
+        assert result["success"] is True
+        assert result["data"]["recommended_action"] == "ESCALATE_TO_HUMAN"
+        assert result["data"]["additional_information_required"] is True
+        assert result["data"]["confidence"] <= 0.5
+
+    def test_diagnosis_rules_vary_with_the_case(self):
+        """Two different cases do not receive the same canned answer."""
+        from app.services.agent_service import call_llm
+
+        base_case = {
+            "case_id": "CASE-A", "amount": 1000.0, "attempt_count": 0,
+        }
+        transaction_a = {
+            "currency": "INR", "payment_method": "card",
+            "failure_reason": "insufficient_funds",
+        }
+        transaction_b = {
+            "currency": "INR", "payment_method": "upi",
+            "failure_reason": "card_expired",
+        }
+        customer = {"total_transactions": 5, "failed_transactions": 1}
+        ml = {"recovery_probability": 0.4}
+
+        first = call_llm("prompt", {
+            "case": base_case, "transaction": transaction_a,
+            "customer": customer, "recovery_probability": ml,
+        })
+        second = call_llm("prompt", {
+            "case": base_case, "transaction": transaction_b,
+            "customer": customer, "recovery_probability": ml,
+        })
+
+        assert first["diagnosis"] != second["diagnosis"]
+        assert first["recommended_action"] == "CREATE_PAYMENT_LINK"
+        assert second["recommended_action"] == "ESCALATE_TO_HUMAN"
+        # Both report the same stored ML probability: it is not the engine's number.
+        assert first["recovery_probability"] == second["recovery_probability"] == 0.4
+
+    def test_confidences_are_a_rule_score_not_a_constant(self):
+        """The confidence varies only with the evidence the rules used."""
+        from app.services.agent_service import _rule_confidence
+
+        assert _rule_confidence(cause_known=True, history_available=True) == 0.7
+        assert _rule_confidence(cause_known=True, history_available=False) == 0.5
+        assert _rule_confidence(cause_known=False, history_available=True) == 0.5
+        assert _rule_confidence(cause_known=False, history_available=False) == 0.3
+
+    def test_no_context_produces_no_diagnosis(self):
+        """Without case data the engine refuses to fabricate a diagnosis."""
+        from app.services.agent_service import call_llm
+
+        assert call_llm("prompt") is None
+        assert call_llm("prompt", None) is None
+
     def test_diagnose_case_does_not_reopen_recovered_case(self, db_session, sample_case):
         """
         Regression test (stop after success): diagnosing a settled case must not
@@ -556,6 +798,31 @@ class TestAgentAPI:
         assert "confidence" in data["data"]
         assert "customer_message" in data["data"]
         assert "additional_information_required" in data["data"]
+
+    def test_diagnose_endpoint_states_the_diagnosis_provenance(self, client, sample_case):
+        """The API response makes the absence of a language model explicit."""
+        response = client.post("/api/agent/diagnose", json={"case_id": "CASE-001"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["diagnosis_source"] == "DETERMINISTIC_RULES"
+        assert data["llm_used"] is False
+        assert data["diagnosis_engine_version"] == "deterministic-rules-v1"
+        assert data["confidence_source"] == "deterministic_rule_score"
+        assert data["recovery_probability_source"] == "ml_model_case_level"
+        assert data["recovery_probability_used"] == 0.65
+
+    def test_case_detail_exposes_the_diagnosis_provenance(self, client, sample_case):
+        """The case detail view can tell rule output from a model answer."""
+        client.post("/api/agent/diagnose", json={"case_id": "CASE-001"})
+
+        response = client.get("/api/cases/CASE-001/detail")
+        assert response.status_code == 200
+        provenance = response.json()["data"]["diagnosis_provenance"]
+
+        assert provenance["diagnosis_source"] == "DETERMINISTIC_RULES"
+        assert provenance["llm_used"] is False
+        assert provenance["recovery_probability_source"] == "ml_model_case_level"
 
     def test_diagnose_endpoint_with_llm_unavailable(self, client, sample_case):
         """Test diagnose endpoint when LLM is unavailable."""

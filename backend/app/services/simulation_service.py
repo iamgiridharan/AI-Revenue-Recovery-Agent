@@ -35,6 +35,7 @@ from app.models import (
     CaseStatus,
     AuditEventType,
 )
+from app.services.action_availability import SIMULATED_CASE_PREFIX
 from app.services.ml_service import predict_recovery
 from app.services.policy_engine import evaluate_action, get_active_policy
 from app.utils.logging import logger
@@ -48,8 +49,11 @@ from app.utils.logging import logger
 SIMULATION_LABEL = "SIMULATED"
 
 # Prefix of every case id created by the simulation pipeline. Metrics use it to
-# separate simulated revenue from webhook-verified revenue.
-SIMULATION_CASE_PREFIX = "SIM-CASE-"
+# separate simulated revenue from webhook-verified revenue.  The value itself
+# lives in action_availability so the Policy Engine can recognise simulation
+# data without importing this module; it is re-exported here for existing
+# callers.
+SIMULATION_CASE_PREFIX = SIMULATED_CASE_PREFIX
 
 # Deterministic recovery outcomes for simulation
 # These are used instead of actual Razorpay calls

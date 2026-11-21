@@ -55,6 +55,19 @@ _REVIEW_FAILURE_STATUS = {
     "CASE_CLOSED": 409,
     "TRANSACTION_NOT_FOUND": 409,
     "EXECUTION_FAILED": 502,
+    # Payment-provider refusals (live keys, half-configured credentials, no usable
+    # client) are deployment problems, not bad requests: report the same 503 the
+    # recovery endpoint returns, so an approval cannot look like a retryable clash.
+    "LIVE_MODE_REJECTED": 503,
+    "PAYMENT_UNCONFIGURED": 503,
+    "PAYMENT_PROVIDER_UNAVAILABLE": 503,
+    # A reminder approved by a reviewer still cannot be delivered when no
+    # delivery channel is configured.
+    "REMINDER_NOT_DELIVERED": 503,
+    # The authorized action cannot be executed in this deployment at all (missing
+    # integration).  The case stays ESCALATED: a reviewer cannot supply an
+    # integration by approving an action.
+    "ACTION_UNAVAILABLE": 409,
 }
 
 # Executable execution result fields that may be shown to the caller.  Provider
@@ -71,6 +84,9 @@ _EXECUTION_FIELDS = (
     "mock",
     "case_reference",
     "message",
+    # Reminder executions report whether anything was actually delivered.
+    "delivery_status",
+    "delivered",
 )
 
 
@@ -308,6 +324,7 @@ def review_case(
             "case_status": case.status,
             "reviewed": True,
             "policy_decision": precheck.model_dump(),
+            "action_availability": getattr(precheck, "action_availability", None),
         }
 
     # The reviewer is the human the HUMAN_REVIEW_REQUIRED gate waits for, so the
@@ -357,6 +374,9 @@ def review_case(
             "case_status": case.status,
             "reviewed": True,
             "policy_decision": execution.get("policy_decision"),
+            "delivery_status": execution.get("delivery_status"),
+            "delivered": execution.get("delivered"),
+            "availability": execution.get("availability"),
         }
 
     logger.info(

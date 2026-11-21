@@ -37,9 +37,14 @@ from app.models import (
     Customer,
     RecoveryAction,
     AuditEvent,
+    AuditEventType,
     CaseStatus,
 )
-from app.services.metrics_service import get_revenue_metrics
+from app.services.metrics_service import (
+    get_revenue_metrics,
+    recovered_case_provenance,
+)
+from app.services.action_availability import availability_catalog, is_simulated_case
 from app.services.value_service import assess_case_value
 from app.utils.logging import logger
 
@@ -58,12 +63,6 @@ def get_dashboard_stats(db: Session) -> Dict[str, Any]:
         func.sum(RevenueRiskCase.amount)
     ).filter(
         RevenueRiskCase.status != CaseStatus.RECOVERED.value
-    ).scalar() or 0.0
-
-    total_recovered = db.query(
-        func.sum(RevenueRiskCase.recovered_amount)
-    ).filter(
-        RevenueRiskCase.recovered_amount > 0
     ).scalar() or 0.0
 
     # Status breakdown
@@ -138,7 +137,9 @@ def get_dashboard_stats(db: Session) -> Dict[str, Any]:
     return {
         "total_cases": total_cases,
         "total_at_risk": round(total_at_risk, 2),
-        "total_recovered": round(total_recovered, 2),
+        # ``total_recovered`` (and the provenance split, the estimated predicted
+        # value and the all-sources total) comes from ``revenue`` below: it is
+        # verified money only, with simulated rupees reported separately.
         # Kept for existing callers: the count-based rate. Its money-weighted
         # counterpart is ``money_recovery_rate`` and the two are not
         # interchangeable, so both are returned with explicit names.
@@ -214,22 +215,42 @@ def get_daily_cases(db: Session, days: int = 30) -> List[Dict[str, Any]]:
 
 
 def get_daily_recovered(db: Session, days: int = 30) -> List[Dict[str, Any]]:
-    """Get daily recovered revenue for the last N days."""
+    """
+    Get daily recovered revenue for the last N days, split by provenance.
+
+    ``amount`` is webhook-verified money (the series a chart may call
+    "recovered"); ``simulated_amount`` and ``unattributed_amount`` are reported
+    beside it so simulated rupees cannot be read as recovered revenue.
+    """
     start_date = datetime.now(timezone.utc) - timedelta(days=days)
-    results = (
-        db.query(
-            func.date(RevenueRiskCase.updated_at).label("date"),
-            func.sum(RevenueRiskCase.recovered_amount).label("amount"),
-        )
+    settled = (
+        db.query(RevenueRiskCase)
         .filter(
             RevenueRiskCase.recovered_amount > 0,
             RevenueRiskCase.updated_at >= start_date,
         )
-        .group_by(func.date(RevenueRiskCase.updated_at))
-        .order_by(func.date(RevenueRiskCase.updated_at))
         .all()
     )
-    return [{"date": str(row.date), "amount": round(row.amount or 0, 2)} for row in results]
+    bucket_by_case = recovered_case_provenance(db)
+
+    by_date: Dict[str, Dict[str, float]] = {}
+    for case in settled:
+        day = str(case.updated_at.date()) if case.updated_at else ""
+        amounts = by_date.setdefault(
+            day, {"verified": 0.0, "simulated": 0.0, "unattributed": 0.0}
+        )
+        bucket = bucket_by_case.get(case.id, "unattributed")
+        amounts[bucket] = round(amounts[bucket] + (case.recovered_amount or 0.0), 2)
+
+    return [
+        {
+            "date": day,
+            "amount": amounts["verified"],
+            "simulated_amount": amounts["simulated"],
+            "unattributed_amount": amounts["unattributed"],
+        }
+        for day, amounts in sorted(by_date.items())
+    ]
 
 
 def get_case_detail_with_relations(db: Session, case_id: str) -> Dict[str, Any]:
@@ -318,6 +339,42 @@ def get_case_detail_with_relations(db: Session, case_id: str) -> Dict[str, Any]:
         for a in audit_events
     ]
 
+    # Provenance of the recorded diagnosis, taken from the latest diagnosis audit
+    # event: it tells the view whether a language model produced it or whether it
+    # came from the deterministic rule engine, and where the probability came
+    # from.
+    diagnosis_event = (
+        db.query(AuditEvent)
+        .filter(
+            AuditEvent.case_id == case.id,
+            AuditEvent.event_type == AuditEventType.DIAGNOSIS_COMPLETED.value,
+        )
+        .order_by(AuditEvent.timestamp.desc(), AuditEvent.id.desc())
+        .first()
+    )
+    diagnosis_metadata = (diagnosis_event.metadata_ or {}) if diagnosis_event else {}
+    diagnosis_provenance = None
+    if diagnosis_event is not None:
+        diagnosis_provenance = {
+            "diagnosis_source": diagnosis_metadata.get(
+                "diagnosis_source", "UNKNOWN_LEGACY_DIAGNOSIS"
+            ),
+            "diagnosis_engine_version": diagnosis_metadata.get(
+                "diagnosis_engine_version"
+            ),
+            "llm_used": diagnosis_metadata.get("llm_used", False),
+            "confidence_source": diagnosis_metadata.get("confidence_source"),
+            "recovery_probability_source": diagnosis_metadata.get(
+                "recovery_probability_source"
+            ),
+            "recovery_probability": diagnosis_metadata.get("recovery_probability"),
+            "recorded_at": (
+                diagnosis_event.timestamp.isoformat()
+                if diagnosis_event.timestamp
+                else None
+            ),
+        }
+
     # Estimated, advisory value assessment (Phase 2). Never an authorization and
     # never a substitute for recovered_amount (actual revenue).  A malformed
     # stored value (e.g. a probability outside [0, 1]) must not break the detail
@@ -335,6 +392,12 @@ def get_case_detail_with_relations(db: Session, case_id: str) -> Dict[str, Any]:
     return {
         "value_assessment": value_assessment,
         "value_assessment_error": value_assessment_error,
+        "diagnosis_provenance": diagnosis_provenance,
+        # Which actions this deployment can execute for this case, and why some
+        # cannot: the UI disables an unavailable pick instead of offering it.
+        "action_availability": availability_catalog(
+            simulated_case=is_simulated_case(case.case_id)
+        ),
         "case": {
             "id": case.id,
             "case_id": case.case_id,

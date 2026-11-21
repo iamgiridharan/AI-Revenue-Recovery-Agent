@@ -67,67 +67,161 @@ function Delta({ amount, pct, invert = false }) {
 
 /**
  * Where the recovered money came from. Simulated rupees and webhook-verified
- * rupees are never added together into a single unlabelled figure.
+ * rupees are never added together into a single unlabelled figure: every
+ * headline uses `verified` only.
  */
 function provenanceSummary(provenance) {
   if (!provenance) return '';
   const parts = [];
   if (provenance.verified?.amount > 0) parts.push(`${formatCurrency(provenance.verified.amount)} webhook-verified`);
-  if (provenance.simulated?.amount > 0) parts.push(`${formatCurrency(provenance.simulated.amount)} simulated`);
-  if (provenance.unattributed?.amount > 0) parts.push(`${formatCurrency(provenance.unattributed.amount)} unattributed`);
+  if (provenance.simulated?.amount > 0) parts.push(`${formatCurrency(provenance.simulated.amount)} simulated (excluded)`);
+  if (provenance.unattributed?.amount > 0) parts.push(`${formatCurrency(provenance.unattributed.amount)} unattributed (excluded)`);
   return parts.join(' \u00b7 ');
 }
 
 /**
- * Says plainly whether executed recovery actions reach Razorpay or are mocked.
- * Without keys every executed action returns a mock.invalid link that cannot be
- * paid, so the dashboard must not imply that money can move.
+ * The three money categories, kept visibly apart: provider-verified revenue, the
+ * simulated rupees it excludes, and the ESTIMATED value still on the table.
  */
+function MoneyProvenance({ stats }) {
+  const provenance = stats.provenance || {};
+  const items = [
+    {
+      label: 'Verified recovered',
+      value: formatCurrency(stats.verified_recovered_amount ?? stats.total_recovered),
+      note: `${provenance.verified?.cases ?? 0} case(s) confirmed by webhook`,
+      tone: 'text-green-700',
+    },
+    {
+      label: 'Simulated (excluded)',
+      value: formatCurrency(stats.simulated_recovered_amount),
+      note: `${provenance.simulated?.cases ?? 0} simulated case(s) \u2014 never counted as revenue`,
+      tone: 'text-amber-700',
+    },
+    {
+      label: 'Unattributed (excluded)',
+      value: formatCurrency(stats.unattributed_recovered_amount),
+      note: `${provenance.unattributed?.cases ?? 0} settled with no audit evidence`,
+      tone: 'text-gray-700',
+    },
+    {
+      label: 'Predicted recovery value',
+      value: formatCurrency(stats.predicted_recovery_value),
+      note: `ESTIMATE over ${stats.predicted_recovery_value_cases ?? 0} open case(s), not revenue`,
+      tone: 'text-blue-700',
+    },
+  ];
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 p-5">
+      <div className="flex items-baseline justify-between mb-3">
+        <h3 className="text-sm font-semibold text-gray-700">Money Provenance</h3>
+        <span className="text-xs text-gray-400">headline figures use verified money only</span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        {items.map((item) => (
+          <div key={item.label} className="bg-gray-50 rounded-lg p-4">
+            <p className="text-xs font-medium text-gray-500">{item.label}</p>
+            <p className={`text-xl font-bold mt-1 ${item.tone}`}>{item.value}</p>
+            <p className="text-[11px] text-gray-400 mt-1">{item.note}</p>
+          </div>
+        ))}
+      </div>
+      {stats.total_recovered_all_sources !== stats.verified_recovered_amount && (
+        <p className="text-[11px] text-gray-400 mt-3">
+          All booked sources together: {formatCurrency(stats.total_recovered_all_sources)} \u2014 shown for
+          reconciliation only, never as recovered revenue.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Says plainly whether executed recovery actions reach Razorpay or are mocked.
+ * The four modes are distinct: TEST_MODE is the only one in which a provider can
+ * be reached. LIVE_REJECTED means live credentials were supplied and refused, so
+ * no client exists and no link can be created — it must never read as TEST MODE.
+ */
+const PAYMENT_MODE_PRESENTATION = {
+  TEST_MODE: {
+    badge: 'TEST MODE',
+    title: 'TEST MODE — Razorpay test keys loaded',
+    body: 'Executing a recovery action creates a real Razorpay test-mode link. Revenue is booked only when a signature-verified webhook confirms the payment. If the provider client is unavailable, execution is refused rather than mocked.',
+    tone: 'blue',
+  },
+  MOCK: {
+    badge: 'MOCK',
+    title: 'MOCK — no provider call',
+    body: 'Razorpay keys are not configured. Executing a recovery action creates a mock.invalid link that cannot be paid, so no customer can settle and no revenue can be booked as recovered.',
+    hint: 'Add RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET to backend/.env to switch to Test Mode.',
+    tone: 'amber',
+  },
+  UNCONFIGURED: {
+    badge: 'UNCONFIGURED',
+    title: 'UNCONFIGURED — incomplete Razorpay credentials',
+    body: 'Razorpay credentials are incomplete or the key prefix is unrecognised. Payment execution is refused — no provider link and no mock link is created, so the case is left untouched. A complete rzp_test_ key + secret pair is required.',
+    hint: 'Set both RAZORPAY_KEY_ID (rzp_test_…) and RAZORPAY_KEY_SECRET, or unset both to run in MOCK mode.',
+    tone: 'amber',
+  },
+  LIVE_REJECTED: {
+    badge: 'LIVE KEY REJECTED',
+    title: 'LIVE_REJECTED — live credentials refused',
+    body: 'A Razorpay live key was supplied and refused: this build runs against Test Mode only. The key was discarded, no payment client exists, and executing a recovery action creates no payment link at all.',
+    hint: 'Replace the live key with rzp_test_ keys from the Razorpay dashboard to run Test Mode.',
+    tone: 'red',
+  },
+};
+
+const PAYMENT_MODE_TONES = {
+  blue: {
+    panel: 'bg-blue-50 border-blue-200',
+    badge: 'bg-blue-200 text-blue-900',
+    title: 'text-blue-900',
+    body: 'text-blue-800',
+    hint: 'text-blue-700',
+  },
+  amber: {
+    panel: 'bg-amber-50 border-amber-200',
+    badge: 'bg-amber-200 text-amber-900',
+    title: 'text-amber-900',
+    body: 'text-amber-800',
+    hint: 'text-amber-700',
+  },
+  red: {
+    panel: 'bg-red-50 border-red-200',
+    badge: 'bg-red-200 text-red-900',
+    title: 'text-red-900',
+    body: 'text-red-800',
+    hint: 'text-red-700',
+  },
+};
+
 function PaymentModeBanner({ config }) {
   if (!config || !config.payments) return null;
   const payments = config.payments;
-  const isMock = payments.mode !== 'TEST_MODE';
+  const presentation =
+    PAYMENT_MODE_PRESENTATION[payments.mode] || PAYMENT_MODE_PRESENTATION.UNCONFIGURED;
+  const tone = PAYMENT_MODE_TONES[presentation.tone];
 
   return (
-    <div
-      className={`rounded-xl border p-4 ${isMock ? 'bg-amber-50 border-amber-200' : 'bg-blue-50 border-blue-200'}`}
-    >
+    <div className={`rounded-xl border p-4 ${tone.panel}`}>
       <div className="flex items-start gap-3">
         <span
-          className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide ${
-            isMock ? 'bg-amber-200 text-amber-900' : 'bg-blue-200 text-blue-900'
-          }`}
+          className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tracking-wide ${tone.badge}`}
         >
-          {isMock ? 'MOCK' : 'TEST MODE'}
+          {presentation.badge}
         </span>
         <div className="min-w-0">
-          <p className={`text-sm font-semibold ${isMock ? 'text-amber-900' : 'text-blue-900'}`}>
-            {isMock
-              ? 'MOCK — no provider call'
-              : 'TEST MODE — Razorpay test keys loaded'}
-          </p>
-          <p className={`text-xs mt-0.5 ${isMock ? 'text-amber-800' : 'text-blue-800'}`}>
-            {isMock
-              ? 'Razorpay keys are not configured. Executing a recovery action creates a mock.invalid link that cannot be paid, so no customer can settle and no revenue can be booked as recovered.'
-              : 'Executing a recovery action creates a real Razorpay test-mode link. Revenue is booked only when a signature-verified webhook confirms the payment.'}
-          </p>
-          {isMock ? (
-            <p className="text-[11px] text-amber-700 mt-1">
-              Add RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET to backend/.env to switch to Test Mode.
+          <p className={`text-sm font-semibold ${tone.title}`}>{presentation.title}</p>
+          <p className={`text-xs mt-0.5 ${tone.body}`}>{presentation.body}</p>
+          {presentation.hint && (
+            <p className={`text-[11px] mt-1 ${tone.hint}`}>{presentation.hint}</p>
+          )}
+          {payments.mode === 'TEST_MODE' && !payments.webhook_configured && (
+            <p className="text-[11px] text-red-700 mt-1">
+              Webhook secret is not configured: every webhook is rejected with 401, so no payment can settle.
             </p>
-          ) : (
-            <div className="text-[11px] mt-1 space-y-0.5">
-              {!payments.webhook_configured && (
-                <p className="text-red-700">
-                  Webhook secret is not configured: every webhook is rejected with 401, so no payment can settle.
-                </p>
-              )}
-              {payments.key_type === 'live' && (
-                <p className="text-red-700">
-                  Live keys detected — this build is intended for Test Mode only.
-                </p>
-              )}
-            </div>
           )}
         </div>
       </div>
@@ -227,18 +321,20 @@ export default function Dashboard() {
           color="text-red-600"
         />
         <StatCard
-          title="Money Recovered"
-          value={formatCurrency(stats.total_recovered)}
-          subtitle={provenanceSummary(stats.provenance) || 'nothing recovered yet'}
+          title="Verified Recovered"
+          value={formatCurrency(stats.verified_recovered_amount ?? stats.total_recovered)}
+          subtitle={provenanceSummary(stats.provenance) || 'no provider-verified recovery yet'}
           color="text-green-600"
         />
         <StatCard
-          title="Money Recovery Rate"
+          title="Verified Recovery Rate"
           value={`${stats.money_recovery_rate ?? 0}%`}
-          subtitle={`${stats.recovery_rate}% of cases settled (${stats.recovered_count} of ${stats.total_cases})`}
+          subtitle={`of case value, webhook-verified only \u00b7 ${stats.recovery_rate}% of cases settled`}
           color="text-blue-600"
         />
       </div>
+
+      <MoneyProvenance stats={stats} />
 
       {/* Last 7 days, with the change against the previous 7 days */}
       <div className="bg-white rounded-xl border border-gray-200 p-5">
@@ -248,11 +344,16 @@ export default function Dashboard() {
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="bg-gray-50 rounded-lg p-4">
-            <p className="text-xs font-medium text-gray-500">Recovered</p>
+            <p className="text-xs font-medium text-gray-500">Verified recovered</p>
             <p className="text-xl font-bold text-green-600 mt-1">{formatCurrency(stats.recovered_7d)}</p>
             <div className="mt-1">
               <Delta amount={stats.recovered_delta_7d} pct={stats.recovered_delta_pct_7d} />
             </div>
+            {stats.simulated_recovered_7d > 0 && (
+              <p className="text-[11px] text-gray-400 mt-1">
+                {formatCurrency(stats.simulated_recovered_7d)} simulated in the same period (excluded)
+              </p>
+            )}
           </div>
           <div className="bg-gray-50 rounded-lg p-4">
             <p className="text-xs font-medium text-gray-500">New money at risk</p>
@@ -313,7 +414,8 @@ export default function Dashboard() {
 
         {/* Revenue Recovered Over Time */}
         <div className="bg-white rounded-xl border border-gray-200 p-5">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Revenue Recovered (Last 30 Days)</h3>
+          <h3 className="text-sm font-semibold text-gray-700 mb-1">Revenue Recovered (Last 30 Days)</h3>
+          <p className="text-xs text-gray-400 mb-3">solid = webhook-verified \u00b7 dashed = simulated (excluded from revenue)</p>
           {dailyRecovered.length > 0 ? (
             <ResponsiveContainer width="100%" height={250}>
               <LineChart data={dailyRecovered}>
@@ -321,7 +423,16 @@ export default function Dashboard() {
                 <XAxis dataKey="date" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
                 <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `₹${v}`} />
                 <Tooltip formatter={(v) => formatCurrency(v)} />
-                <Line type="monotone" dataKey="amount" stroke="#10b981" strokeWidth={2} name="Recovered" dot={false} />
+                <Line type="monotone" dataKey="amount" stroke="#10b981" strokeWidth={2} name="Verified" dot={false} />
+                <Line
+                  type="monotone"
+                  dataKey="simulated_amount"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  strokeDasharray="4 3"
+                  name="Simulated (excluded)"
+                  dot={false}
+                />
               </LineChart>
             </ResponsiveContainer>
           ) : (

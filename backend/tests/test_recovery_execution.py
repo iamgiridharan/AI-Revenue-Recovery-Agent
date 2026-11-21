@@ -21,6 +21,7 @@ replaced with a stub.  Real Test Mode verification requires live credentials.
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,6 +39,12 @@ from app.models import (
     WebhookEvent,
 )
 from app.services.agent_service import diagnose_case
+from app.services import razorpay_service
+
+# Captured at import time, before the autouse fixture replaces the module
+# attribute: a test that needs the real client factory can restore this instead of
+# depending on state left behind by another test.
+REAL_GET_RAZORPAY_CLIENT = razorpay_service.get_razorpay_client
 
 CASE_ID = "CASE-PHASE4-001"
 WEBHOOK_SECRET = "phase4_test_webhook_secret"
@@ -738,3 +745,307 @@ class TestWebhookSettlement:
         db_session.refresh(risk_case)
         assert risk_case.status == CaseStatus.RECOVERED.value
         assert risk_case.recovered_amount == 2500.0
+
+
+# ============================================================================
+# F. Environment safety: live credentials are refused before any provider call
+# ============================================================================
+
+
+class TestLiveCredentialsRefused:
+    """
+    A live Razorpay key must not produce a payment link of any kind.
+
+    The refusal happens below the policy engine: the action is authorized, the
+    provider layer refuses, and the case is left exactly as it was -- no link, no
+    attempt counted, no recovery booked.
+    """
+
+    def test_recovery_is_refused_without_creating_a_link(
+        self, client, db_session, risk_case, active_policy, monkeypatch
+    ):
+        _record_diagnosis(db_session)
+
+        import sys
+        from app.services import razorpay_service
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError(
+                "razorpay.Client must never be constructed from live credentials"
+            )
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_forbidden))
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="rzp_live_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+
+        response = client.post(f"/api/cases/{CASE_ID}/recovery", json={})
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "LIVE_MODE_REJECTED"
+        assert payload["action_executed"] is False
+
+        # No payment link exists in any form: not a provider link, not a mock one.
+        body = json.dumps(response.json())
+        assert "plink_" not in body
+        assert "mock.invalid" not in body
+        assert "rzp.io" not in body
+        # The refused key and secret are never echoed back.
+        assert "rzp_live_keyid_123" not in body
+        assert "super-secret-value" not in body
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.attempt_count == 0
+        assert risk_case.recovered_amount == 0.0
+
+        action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).one()
+        assert action.execution_status == "REFUSED"
+        assert action.api_reference is None
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.event_type == "ACTION_FAILED",
+        ).one()
+        assert audit.decision == "LIVE_MODE_REJECTED"
+        assert audit.result == "REFUSED"
+        assert "refused" in audit.reason.lower()
+
+
+# ============================================================================
+# G. Environment safety: partial / unrecognised credentials are refused
+# ============================================================================
+
+
+class TestUnconfiguredCredentialsRefused:
+    """
+    A half-configured or unrecognised key set must not become a mock link.
+
+    The refusal happens below the policy engine, so the case keeps its status,
+    attempt count and recovered amount, and the refusal is recorded with its own
+    reason instead of looking like a successful mock execution.
+    """
+
+    @pytest.mark.parametrize(
+        "key_id,key_secret,expected",
+        [
+            ("rzp_test_keyid_123", "", "RAZORPAY_KEY_SECRET is missing"),
+            ("", "super-secret-value", "RAZORPAY_KEY_ID is missing"),
+            ("pk_other_prefix", "super-secret-value", "rzp_test_"),
+        ],
+    )
+    def test_execution_is_refused_without_creating_a_link(
+        self,
+        client,
+        db_session,
+        risk_case,
+        active_policy,
+        monkeypatch,
+        key_id,
+        key_secret,
+        expected,
+    ):
+        _record_diagnosis(db_session)
+
+        import sys
+        from app.services import razorpay_service
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError(
+                "razorpay.Client must not be constructed for unusable credentials"
+            )
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_forbidden))
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID=key_id,
+                RAZORPAY_KEY_SECRET=key_secret,
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+
+        response = client.post(f"/api/cases/{CASE_ID}/recovery", json={})
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "PAYMENT_UNCONFIGURED"
+        assert payload["action_executed"] is False
+        # The error is actionable: it names what to fix.
+        assert "mode: UNCONFIGURED" in payload["error"]["message"]
+        assert expected in payload["error"]["message"]
+
+        # No payment link exists in any form: not a provider link, not a mock one.
+        body = json.dumps(response.json())
+        assert "plink_" not in body
+        assert "mock.invalid" not in body
+        assert "rzp.io" not in body
+        # The configured values are never echoed back.
+        if key_id:
+            assert key_id not in body
+        if key_secret:
+            assert key_secret not in body
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.attempt_count == 0
+        assert risk_case.recovered_amount == 0.0
+
+        action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).one()
+        assert action.execution_status == "REFUSED"
+        assert action.api_reference is None
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.event_type == "ACTION_FAILED",
+        ).one()
+        assert audit.decision == "PAYMENT_UNCONFIGURED"
+        assert audit.result == "REFUSED"
+        assert expected in audit.reason
+
+
+# ============================================================================
+# H. Environment safety: TEST_MODE with no usable provider client is refused
+# ============================================================================
+
+
+class TestTestModeProviderUnavailableRefused:
+    """
+    Complete Test Mode credentials with a missing SDK must not become a mock link.
+
+    The application reports TEST_MODE, so the only honest outcomes are a provider
+    link or a refusal.  The refusal is recorded as its own reason and the case is
+    left untouched.
+    """
+
+    def test_execution_is_refused_without_creating_a_link(
+        self, client, db_session, risk_case, active_policy, monkeypatch
+    ):
+        _record_diagnosis(db_session)
+
+        import sys
+        from app.services import razorpay_service
+
+        # ``None`` in sys.modules makes ``import razorpay`` fail deterministically.
+        # The real factory is restored so the missing-SDK path actually runs: with
+        # the suite-wide "no client" stub in place the reason could only come from
+        # state left by another test.
+        monkeypatch.setitem(sys.modules, "razorpay", None)
+        monkeypatch.setattr(
+            razorpay_service, "get_razorpay_client", REAL_GET_RAZORPAY_CLIENT
+        )
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+        monkeypatch.setattr(razorpay_service, "_razorpay_client_error", None, raising=False)
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="rzp_test_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+
+        response = client.post(f"/api/cases/{CASE_ID}/recovery", json={})
+
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "PAYMENT_PROVIDER_UNAVAILABLE"
+        assert payload["action_executed"] is False
+        assert "mode: TEST_MODE" in payload["error"]["message"]
+        assert "not installed" in payload["error"]["message"]
+
+        # No payment link exists in any form: not a provider link, not a mock one.
+        body = json.dumps(response.json())
+        assert "plink_" not in body
+        assert "mock.invalid" not in body
+        assert "rzp.io" not in body
+        assert "super-secret-value" not in body
+        assert "rzp_test_keyid_123" not in body
+
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.attempt_count == 0
+        assert risk_case.recovered_amount == 0.0
+
+        action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).one()
+        assert action.execution_status == "REFUSED"
+        assert action.api_reference is None
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.event_type == "ACTION_FAILED",
+        ).one()
+        assert audit.decision == "PAYMENT_PROVIDER_UNAVAILABLE"
+        assert audit.result == "REFUSED"
+        assert "unavailable" in audit.reason.lower()
+
+
+# ============================================================================
+# A reminder is never reported as sent
+# ============================================================================
+
+
+class TestReminderUnavailable:
+    """
+    Phase 2.1: SEND_PAYMENT_REMINDER cannot be delivered in this build, so the
+    endpoint refuses it as an unavailable action instead of reporting a sent
+    reminder (or even a recorded attempt).
+    """
+
+    def test_reminder_endpoint_reports_action_unavailable(
+        self, client, db_session, risk_case, active_policy
+    ):
+        _record_diagnosis(db_session, action="SEND_PAYMENT_REMINDER")
+
+        response = client.post(f"/api/cases/{CASE_ID}/recovery", json={})
+
+        assert response.status_code == 409
+        payload = response.json()
+        assert payload["success"] is False
+        assert payload["error"]["code"] == "ACTION_UNAVAILABLE"
+        assert payload["action_executed"] is False
+        assert "not executable in this deployment" in payload["error"]["message"]
+        assert "reminder_delivery_provider" in payload["availability"]["required_integration"]
+        assert payload["availability"]["availability"] == "SIMULATED_ONLY"
+        assert payload["availability"]["executable"] is False
+        # Nothing was attempted, so no delivery state exists to report.
+        assert payload["delivery_status"] is None
+        assert payload["delivered"] is None
+
+        # The action is not recorded as an attempt and no executed event is written.
+        assert db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).count() == 0
+        assert db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.event_type == "ACTION_EXECUTED",
+        ).count() == 0
+
+        # Nothing was recovered and the case was not advanced.
+        db_session.refresh(risk_case)
+        assert risk_case.recovered_amount == 0.0
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.attempt_count == 0

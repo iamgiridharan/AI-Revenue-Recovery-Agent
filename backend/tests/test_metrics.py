@@ -44,8 +44,15 @@ def make_case(
     created_at: datetime = None,
     updated_at: datetime = None,
     case_id: str = None,
+    verified: bool = False,
 ) -> RevenueRiskCase:
-    """Create a complete case (customer + transaction + case) with set timestamps."""
+    """Create a complete case (customer + transaction + case) with set timestamps.
+
+    ``verified=True`` records the webhook settlement event that makes the recovered
+    money count as provider-verified (the only bucket the headline figures use).
+    Without it the money is ``unattributed`` and therefore excluded from the
+    headline.
+    """
     n = _next_id()
     customer = Customer(
         customer_id=f"CUST-MET-{n:04d}",
@@ -83,6 +90,16 @@ def make_case(
     db_session.add(case)
     db_session.commit()
     db_session.refresh(case)
+
+    if verified and recovered_amount > 0:
+        add_execution_event(
+            db_session,
+            case,
+            actor="webhook",
+            decision="payment.captured",
+            metadata={"payment_id": f"pay_met_{n}", "event_type": "payment.captured"},
+        )
+
     return case
 
 
@@ -146,7 +163,10 @@ class TestMixedStatuses:
         Both are reported, separately named, and must never be conflated.
         """
         make_case(db_session, 2500.0, status="OPEN")
-        make_case(db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0)
+        make_case(
+            db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0,
+            verified=True,
+        )
 
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["total_case_value"] == 4000.0
@@ -161,7 +181,10 @@ class TestMixedStatuses:
         """value − recovered = outstanding, and old total_at_risk agrees with it."""
         make_case(db_session, 2500.0, status="OPEN")
         make_case(db_session, 900.0, status="IN_PROGRESS")
-        make_case(db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0)
+        make_case(
+            db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0,
+            verified=True,
+        )
         make_case(db_session, 100.0, status="CLOSED")
 
         metrics = get_revenue_metrics(db_session, now=NOW)
@@ -205,7 +228,10 @@ class TestNoDoubleCounting:
 
     def test_partial_recovery_is_not_counted_as_full(self, db_session):
         """recovered_amount is what counts, not the case's face value."""
-        make_case(db_session, 1000.0, status="RECOVERED", recovered_amount=400.0)
+        make_case(
+            db_session, 1000.0, status="RECOVERED", recovered_amount=400.0,
+            verified=True,
+        )
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["total_recovered"] == 400.0
         assert metrics["outstanding_amount"] == 600.0
@@ -225,6 +251,7 @@ class TestPeriodWindows:
             status="RECOVERED",
             recovered_amount=700.0,
             updated_at=NOW - WEEK,
+            verified=True,
         )
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["recovered_7d"] == 700.0
@@ -237,6 +264,7 @@ class TestPeriodWindows:
             status="RECOVERED",
             recovered_amount=650.0,
             updated_at=NOW - WEEK - timedelta(seconds=1),
+            verified=True,
         )
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["recovered_7d"] == 0.0
@@ -249,6 +277,7 @@ class TestPeriodWindows:
             status="RECOVERED",
             recovered_amount=500.0,
             updated_at=NOW - timedelta(days=20),
+            verified=True,
         )
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["recovered_7d"] == 0.0
@@ -281,10 +310,12 @@ class TestPeriodWindows:
         make_case(
             db_session, 300.0, status="RECOVERED", recovered_amount=300.0,
             updated_at=NOW - timedelta(days=1),
+            verified=True,
         )
         make_case(
             db_session, 100.0, status="RECOVERED", recovered_amount=100.0,
             updated_at=NOW - timedelta(days=8),
+            verified=True,
         )
         metrics = get_revenue_metrics(db_session, now=NOW)
         assert metrics["recovered_7d"] == 300.0
@@ -362,7 +393,12 @@ class TestProvenance:
         total = round(
             sum(provenance[b]["amount"] for b in ("verified", "simulated", "unattributed")), 2
         )
-        assert total == metrics["total_recovered"] == 1000.0
+        assert total == metrics["total_recovered_all_sources"] == 1000.0
+        # The headline is the verified bucket only, and the simulated rupees are
+        # reported separately rather than added to it.
+        assert metrics["total_recovered"] == metrics["verified_recovered_amount"] == 500.0
+        assert metrics["simulated_recovered_amount"] == 300.0
+        assert metrics["unattributed_recovered_amount"] == 200.0
 
 
 # ============================================================================
@@ -388,7 +424,10 @@ class TestDashboardExposure:
 
     def test_stats_endpoint_exposes_both_rates_and_provenance(self, client, db_session, policy):
         make_case(db_session, 2500.0, status="OPEN")
-        make_case(db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0)
+        make_case(
+            db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0,
+            verified=True,
+        )
 
         response = client.get("/api/dashboard/stats")
         assert response.status_code == 200
@@ -407,10 +446,173 @@ class TestDashboardExposure:
         assert "recovered_delta_7d" in data and "recovered_delta_pct_7d" in data
 
     def test_stats_still_reports_legacy_totals(self, client, db_session, policy):
-        """Existing keys keep their old meaning so old callers do not break."""
+        """Existing keys keep their names so old callers do not break."""
         make_case(db_session, 2500.0, status="OPEN")
-        make_case(db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0)
+        make_case(
+            db_session, 1500.0, status="RECOVERED", recovered_amount=1500.0,
+            verified=True,
+        )
 
         data = client.get("/api/dashboard/stats").json()["data"]
         assert data["total_at_risk"] == 2500.0
         assert data["total_recovered"] == 1500.0
+
+
+# ============================================================================
+# Verified, simulated and predicted money are separate figures
+# ============================================================================
+
+
+class TestMoneySeparation:
+    """
+    Headline recovery figures use provider-verified money only.
+
+    Simulated rupees are reported beside it (never added), and the predicted
+    recovery value is labelled as an estimate.
+    """
+
+    @pytest.fixture
+    def policy(self, db_session):
+        existing = (
+            db_session.query(PolicyConfig).filter(PolicyConfig.is_active == True).first()  # noqa: E712
+        )
+        if existing:
+            return existing
+        p = PolicyConfig(
+            max_retries=2, max_reminders=2, max_recovery_attempts=3,
+            autonomous_amount_limit=10000.0, minimum_ai_confidence=0.3,
+            minimum_recovery_probability=0.2, case_lifetime_days=7, is_active=True,
+        )
+        db_session.add(p)
+        db_session.commit()
+        return p
+
+    def test_headline_excludes_simulated_money(self, db_session):
+        make_case(
+            db_session, 500.0, status="RECOVERED", recovered_amount=500.0,
+            verified=True,
+        )
+        make_case(
+            db_session, 300.0, status="RECOVERED", recovered_amount=300.0,
+            case_id="SIM-CASE-SEP-000001",
+        )
+
+        metrics = get_revenue_metrics(db_session, now=NOW)
+
+        assert metrics["verified_recovered_amount"] == 500.0
+        assert metrics["simulated_recovered_amount"] == 300.0
+        assert metrics["total_recovered"] == 500.0
+        assert metrics["total_recovered_all_sources"] == 800.0
+        assert metrics["money_recovery_rate"] == 62.5
+        assert metrics["money_recovery_rate_all_sources"] == 100.0
+        assert metrics["outstanding_amount"] == 0.0
+        assert metrics["reconciles"] is True
+
+    def test_unattributed_money_is_not_headline_revenue(self, db_session):
+        make_case(db_session, 999.0, status="RECOVERED", recovered_amount=999.0)
+
+        metrics = get_revenue_metrics(db_session, now=NOW)
+
+        assert metrics["unattributed_recovered_amount"] == 999.0
+        assert metrics["verified_recovered_amount"] == 0.0
+        assert metrics["total_recovered"] == 0.0
+        assert metrics["money_recovery_rate"] == 0.0
+        assert metrics["money_recovery_rate_all_sources"] == 100.0
+
+    def test_predicted_recovery_value_is_an_estimate_over_open_cases(self, db_session):
+        # make_case stores recovery_probability=0.6.
+        make_case(db_session, 1000.0, status="OPEN")
+        make_case(
+            db_session, 500.0, status="RECOVERED", recovered_amount=500.0,
+            verified=True,
+        )
+
+        metrics = get_revenue_metrics(db_session, now=NOW)
+
+        assert metrics["predicted_recovery_value"] == 600.0
+        assert metrics["predicted_recovery_value_cases"] == 1
+        assert "estimate" in metrics["predicted_recovery_value_source"].lower()
+        # It is not revenue: it does not touch the recovered figure.
+        assert metrics["total_recovered"] == 500.0
+
+    def test_predicted_value_excludes_cases_without_a_probability(self, db_session):
+        case = make_case(db_session, 1000.0, status="OPEN")
+        case.recovery_probability = None
+        db_session.commit()
+
+        metrics = get_revenue_metrics(db_session, now=NOW)
+
+        assert metrics["predicted_recovery_value"] == 0.0
+        assert metrics["predicted_recovery_value_cases"] == 0
+        assert metrics["predicted_recovery_value_excluded_cases"] == 1
+
+    def test_seven_day_figures_split_verified_and_simulated(self, db_session):
+        make_case(
+            db_session, 300.0, status="RECOVERED", recovered_amount=300.0,
+            updated_at=NOW - timedelta(days=1), verified=True,
+        )
+        make_case(
+            db_session, 200.0, status="RECOVERED", recovered_amount=200.0,
+            updated_at=NOW - timedelta(days=1), case_id="SIM-CASE-SEP-000002",
+        )
+
+        metrics = get_revenue_metrics(db_session, now=NOW)
+
+        assert metrics["recovered_7d"] == 300.0
+        assert metrics["simulated_recovered_7d"] == 200.0
+        assert metrics["recovered_7d_all_sources"] == 500.0
+        assert metrics["recovered_delta_7d"] == 300.0
+
+    def test_stats_expose_definitions_and_separated_figures(
+        self, client, db_session, policy
+    ):
+        make_case(
+            db_session, 500.0, status="RECOVERED", recovered_amount=500.0,
+            verified=True,
+        )
+        make_case(
+            db_session, 300.0, status="RECOVERED", recovered_amount=300.0,
+            case_id="SIM-CASE-SEP-000003",
+        )
+        make_case(db_session, 1000.0, status="OPEN")
+
+        data = client.get("/api/dashboard/stats").json()["data"]
+
+        assert data["verified_recovered_amount"] == 500.0
+        assert data["simulated_recovered_amount"] == 300.0
+        assert data["total_recovered"] == 500.0
+        assert data["total_recovered_all_sources"] == 800.0
+        assert data["predicted_recovery_value"] == 600.0
+        assert data["money_recovery_rate"] == round(
+            data["verified_recovered_amount"] / data["total_case_value"] * 100, 1
+        )
+        assert set(data["metric_definitions"]) >= {
+            "verified_recovered_amount",
+            "simulated_recovered_amount",
+            "predicted_recovery_value",
+        }
+
+    def test_daily_recovered_chart_separates_provenance(
+        self, client, db_session, policy
+    ):
+        # The chart endpoint is relative to the real "now", unlike the metrics
+        # helper whose clock this test overrides.
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        make_case(
+            db_session, 400.0, status="RECOVERED", recovered_amount=400.0,
+            updated_at=yesterday, verified=True,
+        )
+        make_case(
+            db_session, 250.0, status="RECOVERED", recovered_amount=250.0,
+            updated_at=yesterday, case_id="SIM-CASE-SEP-000004",
+        )
+
+        response = client.get("/api/dashboard/charts/daily-recovered?days=30")
+        assert response.status_code == 200
+        rows = response.json()["data"]
+
+        assert rows, "expected at least one day of recovery data"
+        total_verified = round(sum(row["amount"] for row in rows), 2)
+        total_simulated = round(sum(row["simulated_amount"] for row in rows), 2)
+        assert total_verified == 400.0
+        assert total_simulated == 250.0

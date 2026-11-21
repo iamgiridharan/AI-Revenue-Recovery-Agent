@@ -47,6 +47,13 @@ from app.models import CaseStatus, RevenueRiskCase
 # exact rules used for the eligibility pre-check are always the ones in
 # app.services.policy_engine, and so tests can observe the call.
 from app.services import policy_engine
+from app.services.action_availability import (
+    EXECUTOR_ACTIONS,
+    action_availability,
+    availability_catalog,
+    executable_actions,
+    is_simulated_case,
+)
 from app.utils.logging import logger
 
 # ============================================================================
@@ -65,15 +72,15 @@ FORMULA = {
     "utility_score": "expected_net_recovery - configured_penalties",
 }
 
-#: Actions this system can actually execute (see recovery_service).  Only these
-#: are ranked as recovery candidates.  NO_ACTION / ESCALATE_TO_HUMAN /
+#: Actions that can actually be carried out in this deployment (see
+#: ``app.services.action_availability``).  Only these are ranked as recovery
+#: candidates.  An action that is supported but has no working integration here
+#: -- SEND_PAYMENT_REMINDER without an email/SMS provider -- is reported as
+#: unavailable instead of being ranked: recommending an action the system cannot
+#: perform would be a promise it cannot keep.  NO_ACTION / ESCALATE_TO_HUMAN /
 #: MARK_UNRECOVERABLE generate no recovery revenue, and WAIT_AND_RETRY has no
-#: executor (``execute_recovery_action`` rejects it), so none of them are ranked.
-EXECUTABLE_ACTIONS: Tuple[str, ...] = (
-    "CREATE_PAYMENT_LINK",
-    "RETRY",
-    "SEND_PAYMENT_REMINDER",
-)
+#: executor, so none of those are ranked either.
+EXECUTABLE_ACTIONS: Tuple[str, ...] = executable_actions()
 
 #: Case statuses that can no longer receive a recovery recommendation.
 TERMINAL_STATUSES: Tuple[str, ...] = (
@@ -241,6 +248,11 @@ def _probability_for_action(
 # CANDIDATES, ELIGIBILITY, RANKING
 # ============================================================================
 
+def _availability(action: str, case: RevenueRiskCase) -> Dict[str, Any]:
+    """The shared availability entry for ``action`` on ``case``."""
+    return action_availability(action, simulated_case=is_simulated_case(case.case_id))
+
+
 def _eligibility(
     db,
     case: RevenueRiskCase,
@@ -263,7 +275,15 @@ def _eligibility(
         )
 
     if action not in EXECUTABLE_ACTIONS:
-        return False, f"{action} is not an executable recovery action", None
+        # The same catalog the Policy Engine consults, so the two cannot disagree
+        # about what this deployment can execute.
+        availability = _availability(action, case)
+        return (
+            False,
+            (f"{action} is not executable in this deployment "
+             f"({availability['availability']}): {availability['reason']}"),
+            None,
+        )
 
     # Non-authorizing policy pre-filter.  Confidence/probability are passed as
     # the case-level values already stored on the case; this mirrors what the
@@ -358,8 +378,23 @@ def assess_case_value(
 
     candidates: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
+    unavailable: List[Dict[str, Any]] = []
 
-    for index, action in enumerate(EXECUTABLE_ACTIONS):
+    for action in EXECUTOR_ACTIONS:
+        availability = _availability(action, case)
+        if not availability["executable"]:
+            # Kept visible (with the missing integration named) but never ranked or
+            # recommended.
+            unavailable.append({
+                "action": action,
+                "availability": availability["availability"],
+                "reason": availability["reason"],
+                "required_integration": availability["required_integration"],
+                "available_in_simulation": availability["available_in_simulation"],
+                "simulated_only": availability["simulated_only"],
+            })
+            continue
+
         eligible, reason, policy_decision = _eligibility(db, case, action)
         probability, probability_source = _probability_for_action(
             action, case_probability, action_probabilities
@@ -376,6 +411,8 @@ def assess_case_value(
         entry: Dict[str, Any] = {
             "action": action,
             "eligible": eligible,
+            "availability": availability["availability"],
+            "supporting_integration": availability["required_integration"],
             "eligibility_reason": reason,
             "policy_precheck_decision": policy_decision,
             "probability": probability,
@@ -465,15 +502,26 @@ def assess_case_value(
         "utility_score": utility,
         "candidates": ranked_candidates,
         "excluded_candidates": excluded,
+        # Supported action types this deployment cannot execute, and why.  They are
+        # never recommended; the reason names the integration that is missing.
+        "unavailable_actions": unavailable,
+        # The full catalog, so a caller can explain every option without inferring
+        # capability from the ranking.
+        "action_availability": availability_catalog(
+            simulated_case=is_simulated_case(case.case_id)
+        ),
+        "executable_actions": list(EXECUTABLE_ACTIONS),
+        "availability_source": "app.services.action_availability",
         "recommended_action": top["action"] if top else None,
         "ranking_basis": (
             RANKING_BASIS_NET if top and top["expected_net_recovery"] is not None
             else RANKING_BASIS_GROSS
         ),
         "ranking_note": (
-            "ranking is advisory and deterministic: candidates are ordered by "
-            "expected net recovery (or expected gross recovery when no cost is "
-            "configured), ties broken by the declared action order"
+            "ranking is advisory and deterministic: only actions this deployment "
+            "can execute are candidates; they are ordered by expected net "
+            "recovery (or expected gross recovery when no cost is configured), "
+            "ties broken by the declared action order"
         ),
         "assumptions": [
             "the payment amount comes from the trusted database record (case.amount)",
@@ -482,6 +530,9 @@ def assess_case_value(
             "intervention costs are only used when explicitly configured; no "
             "cost is assumed",
             "penalties affect only the utility score and are itemized separately",
+            "only actions this deployment can execute are ranked: an action whose "
+            "integration is missing is reported under unavailable_actions instead, "
+            "because recommending it would promise something the system cannot do",
             "a value assessment is not an AI recommendation, so the case's ML "
             "recovery probability is passed to the policy pre-check as both the "
             "confidence and recovery-probability input; this can only exclude "
@@ -506,6 +557,11 @@ def assess_case_value(
                 "value scoring ranks eligible candidates only; it never "
                 "authorizes or executes an action. The Policy Engine is "
                 "consulted again (and recorded) when an action is executed."
+            ),
+            "availability_note": (
+                "executable_actions and unavailable_actions come from the same "
+                "catalog the Policy Engine uses (ACTION_AVAILABILITY), so an "
+                "action excluded here cannot be approved there."
             ),
         },
     }

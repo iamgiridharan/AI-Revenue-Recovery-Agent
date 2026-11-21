@@ -97,11 +97,30 @@ class AgentRecommendation(BaseModel):
 
 
 class AgentDiagnosisResponse(BaseModel):
-    """Response from the agent diagnosis endpoint."""
+    """
+    Response from the agent diagnosis endpoint.
+
+    The provenance fields exist so a consumer can tell rule-based output from a
+    language-model answer: no LLM runs in this build, so ``llm_used`` is false
+    and ``diagnosis_source`` names the deterministic engine.
+    """
     success: bool = True
     data: AgentRecommendation
     case_id: str
     model_used: str
+    diagnosis_source: Optional[str] = Field(
+        default=None, description="Engine that produced the diagnosis"
+    )
+    diagnosis_engine_version: Optional[str] = None
+    llm_used: Optional[bool] = Field(
+        default=None, description="False when no language model produced the diagnosis"
+    )
+    confidence_source: Optional[str] = Field(
+        default=None, description="Where the confidence value came from"
+    )
+    recovery_probability_source: Optional[str] = Field(
+        default=None, description="Where the recovery probability came from"
+    )
     processing_time_ms: Optional[float] = None
 
 
@@ -111,3 +130,4 @@ class AgentErrorResponse(BaseModel):
     error: dict
     case_id: str
     fallback_action: Optional[str] = None
+    fallback_reason: Optional[str] = None

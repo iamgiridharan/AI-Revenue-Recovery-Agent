@@ -98,6 +98,19 @@ def recovered_case(db_session, customer, transaction):
     db_session.add(case)
     db_session.commit()
     db_session.refresh(case)
+
+    # Record the webhook settlement: recovered money is only counted as verified
+    # (and therefore as headline revenue) when a settling webhook event exists.
+    db_session.add(AuditEvent(
+        case_id=case.id,
+        event_type="ACTION_EXECUTED",
+        actor="webhook",
+        decision="payment.captured",
+        action="PAYMENT_RECEIVED",
+        result="SUCCESS",
+        metadata_={"payment_id": "pay_dash_002", "event_type": "payment.captured"},
+    ))
+    db_session.commit()
     return case
 
 

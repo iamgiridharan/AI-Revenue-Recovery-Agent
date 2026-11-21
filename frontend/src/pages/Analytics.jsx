@@ -29,6 +29,9 @@ const ACTION_STATUS_COLORS = {
   BLOCKED_BY_POLICY: '#f59e0b',
   PENDING: '#6b7280',
   ESCALATED: '#f97316',
+  // Reminder attempts that never reached a customer.
+  NOT_SENT: '#94a3b8',
+  SIMULATED: '#cbd5e1',
 };
 
 function formatCurrency(amount) {
@@ -98,14 +101,17 @@ export default function Analytics() {
   // bars therefore always sum to the total, and "outstanding" cannot drift away
   // from recovered as case statuses change.
   const revenueComparison = [
-    { name: 'Recovered', value: stats?.total_recovered || 0 },
+    { name: 'Verified recovered', value: verifiedRecovered },
     { name: 'Outstanding', value: stats?.outstanding_amount || 0 },
   ];
   const totalCaseValue = stats?.total_case_value || 0;
+  const verifiedRecovered = stats?.verified_recovered_amount ?? stats?.total_recovered ?? 0;
+  const simulatedRecovered = stats?.simulated_recovered_amount ?? 0;
+  const unattributedRecovered = stats?.unattributed_recovered_amount ?? 0;
   const provenanceParts = [];
-  if (stats?.provenance?.verified?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.verified.amount)} webhook-verified`);
-  if (stats?.provenance?.simulated?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.simulated.amount)} simulated`);
-  if (stats?.provenance?.unattributed?.amount > 0) provenanceParts.push(`${formatCurrency(stats.provenance.unattributed.amount)} unattributed`);
+  if (verifiedRecovered > 0) provenanceParts.push(`${formatCurrency(verifiedRecovered)} webhook-verified`);
+  if (simulatedRecovered > 0) provenanceParts.push(`${formatCurrency(simulatedRecovered)} simulated (excluded)`);
+  if (unattributedRecovered > 0) provenanceParts.push(`${formatCurrency(unattributedRecovered)} unattributed (excluded)`);
 
   return (
     <div className="space-y-6">
@@ -117,9 +123,10 @@ export default function Analytics() {
       {/* Revenue Comparison */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-white rounded-xl border border-gray-200 p-5">
-          <h3 className="text-sm font-semibold text-gray-700 mb-4">Recovered vs Outstanding</h3>
+          <h3 className="text-sm font-semibold text-gray-700 mb-4">Verified Recovered vs Outstanding</h3>
           <p className="text-xs text-gray-400 -mt-3 mb-3">
-            Of {formatCurrency(totalCaseValue)} case value — both bars share this denominator
+            Of {formatCurrency(totalCaseValue)} case value — both bars share this denominator and
+            use webhook-verified money only
           </p>
           <ResponsiveContainer width="100%" height={250}>
             <BarChart data={revenueComparison}>
@@ -133,12 +140,26 @@ export default function Analytics() {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+          <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+            <div className="bg-amber-50 rounded-lg px-3 py-2">
+              <p className="text-amber-700 font-medium">Simulated (excluded)</p>
+              <p className="text-amber-800 font-bold">{formatCurrency(simulatedRecovered)}</p>
+            </div>
+            <div className="bg-blue-50 rounded-lg px-3 py-2">
+              <p className="text-blue-700 font-medium">Predicted recovery value</p>
+              <p className="text-blue-800 font-bold">{formatCurrency(stats?.predicted_recovery_value)}</p>
+              <p className="text-[11px] text-blue-600">estimate, not revenue</p>
+            </div>
+          </div>
         </div>
 
         <div className="bg-white rounded-xl border border-gray-200 p-5">
           <h3 className="text-sm font-semibold text-gray-700 mb-4">Recovery Rate</h3>
           <p className="text-xs text-gray-400 -mt-3 mb-3">
-            Money-weighted headline — rupees back against all case value
+            Money-weighted headline — webhook-verified rupees against all case value
+            {stats?.money_recovery_rate_all_sources !== stats?.money_recovery_rate && (
+              <span className="text-gray-400"> · {stats?.money_recovery_rate_all_sources ?? 0}% including simulated/unattributed</span>
+            )}
           </p>
           <div className="flex items-center justify-center h-[230px]">
             <div className="text-center">
@@ -165,8 +186,8 @@ export default function Analytics() {
                   <p className="text-[11px] text-gray-400">{stats?.recovered_count || 0} of {stats?.total_cases || 0} cases</p>
                 </div>
                 <div>
-                  <p className="text-gray-500">Recovered</p>
-                  <p className="font-bold text-green-600">{formatCurrency(stats?.total_recovered)}</p>
+                  <p className="text-gray-500">Verified recovered</p>
+                  <p className="font-bold text-green-600">{formatCurrency(verifiedRecovered)}</p>
                   <p className="text-[11px] text-gray-400">of {formatCurrency(totalCaseValue)}</p>
                 </div>
               </div>
@@ -247,6 +268,8 @@ export default function Analytics() {
                 <Bar dataKey="BLOCKED_BY_POLICY" stackId="a" fill="#f59e0b" name="Blocked" />
                 <Bar dataKey="PENDING" stackId="a" fill="#d1d5db" name="Pending" />
                 <Bar dataKey="ESCALATED" stackId="a" fill="#f97316" name="Escalated" />
+                <Bar dataKey="NOT_SENT" stackId="a" fill="#94a3b8" name="Not sent" />
+                <Bar dataKey="SIMULATED" stackId="a" fill="#cbd5e1" name="Simulated" />
               </BarChart>
             </ResponsiveContainer>
           ) : (

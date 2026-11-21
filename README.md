@@ -4,7 +4,7 @@ An AI-powered system that detects failed payments, predicts recovery probability
 
 **Status:** MVP Complete — Recovery Pipeline Verified ✅  
 **Payment Integration:** Razorpay Test Mode ONLY  
-**Latest Verification:** 435 automated tests passing; simulated recovery outcomes, the controlled Test Mode recovery flow (locally executed against a stub provider), the human-review flow, MOCK-vs-Test-Mode reporting, and money-weighted metrics with provenance labelling confirmed
+**Latest Verification:** 529 automated tests passing; simulated recovery outcomes, the controlled Test Mode recovery flow (locally executed against a stub provider), the human-review flow, MOCK-vs-Test-Mode reporting, reminder delivery truthfulness (NOT_SENT / SIMULATED), deterministic diagnosis provenance, and separated verified / simulated / predicted money figures confirmed
 
 ---
 
@@ -31,7 +31,7 @@ An end-to-end AI agent that:
 The project has been verified end-to-end with the following results:
 
 ### Automated Tests
-- **435 tests passing** across 14 test files
+- **529 tests passing** across 16 test files
 - Coverage includes models, API endpoints, ML pipeline, agent service, policy engine, payment integration, dashboard, simulation, and end-to-end scenarios
 
 ### Simulated Recovery Outcomes
@@ -171,7 +171,7 @@ ai-revenue-recovery-agent/
 │   │   │   ├── dashboard_service.py # Dashboard aggregates
 │   │   │   └── simulation_service.py # Batch simulation
 │   │   └── utils/             # Errors, logging
-│   ├── tests/                 # 14 test files, 435 tests
+│   ├── tests/                 # 16 test files, 529 tests
 │   ├── alembic/               # Database migrations
 │   └── requirements.txt
 ├── frontend/                   # React SPA
@@ -205,7 +205,8 @@ ai-revenue-recovery-agent/
 1. Payment fails (webhook/manual)
 2. Revenue Risk Case created
 3. ML Model predicts recovery probability
-4. AI Agent diagnoses failure, recommends action
+4. Diagnosis engine classifies the stored failure reason and recommends action
+   (deterministic rules, no LLM in this build — see *Diagnosis provenance*)
 5. Policy Engine validates recommendation
    → APPROVED: proceed to step 6
    → BLOCKED: stop, audit, notify
@@ -275,10 +276,78 @@ The simulation engine runs synthetic transactions through the complete pipeline 
 | NO_ACTION | No recovery action needed |
 | RETRY | Retry the failed payment |
 | CREATE_PAYMENT_LINK | Create Razorpay payment link |
-| SEND_PAYMENT_REMINDER | Send reminder to customer |
+| SEND_PAYMENT_REMINDER | Reminder to customer — **unavailable in this build** (no email/SMS provider): never recommended or authorized, simulation-only; see below |
 | WAIT_AND_RETRY | Wait and retry later |
 | ESCALATE_TO_HUMAN | Escalate to human review |
 | MARK_UNRECOVERABLE | Mark as unrecoverable |
+
+### Action availability: recommend only what can be executed
+
+`backend/app/services/action_availability.py` is the single catalog of what this
+deployment can carry out. The value ranking, the Policy Engine, the recovery
+executor, the agent tools, the API and the UI all read it, so a recommendation and
+an authorization cannot disagree.
+
+| State | Meaning | Recommended / authorized? |
+|-------|---------|---------------------------|
+| `EXECUTABLE` | The action has working integration here (`CREATE_PAYMENT_LINK`, `RETRY`) | Yes |
+| `SIMULATED_ONLY` | Supported, but the integration it needs is missing, so only the simulation pipeline can carry it out (`SEND_PAYMENT_REMINDER`) | No — excluded from ranking, refused by policy |
+| `UNAVAILABLE` | No executor at all (decision actions such as `NO_ACTION`, `WAIT_AND_RETRY`, `ESCALATE_TO_HUMAN`, `MARK_UNRECOVERABLE`) or an unknown action type | No |
+
+A reminder needs an email/SMS provider, which is not integrated, so it is
+`SIMULATED_ONLY`: `POST /api/cases/{id}/recovery` answers `409` with
+`code: ACTION_UNAVAILABLE`, `availability` naming the missing
+`reminder_delivery_provider`, and **no attempt is recorded at all** — the case is
+untouched and no reminder or attempt budget is spent. The value ranking lists it
+under `unavailable_actions` instead of `candidates`, and the case page disables the
+pick and shows the reason. A named reviewer cannot override it either: approving a
+reminder is refused by the Policy Engine (`ACTION_AVAILABILITY`), so the case stays
+`ESCALATED`.
+
+The reminder functionality itself is preserved and stays extensible: implement
+delivery and return the channel from `reminder_delivery_channel()`, and the reminder
+becomes `EXECUTABLE` everywhere at once. Behind the authorization gate the executor
+still records the truth instead of a fabricated success:
+
+| State | Meaning | Consumes a reminder / attempt budget? |
+|-------|---------|---------------------------------------|
+| `NOT_SENT` | Reached the executor with no delivery channel; nothing left the system | **No** |
+| `SIMULATED` | The case is simulation data; nothing left the system | Yes (simulation flow) |
+| `DELIVERED` | A provider confirmed delivery — requires a real channel, so it is not produced in this build | Yes |
+
+If an execution ever does reach that path, the API answers `503` with
+`code: REMINDER_NOT_DELIVERED`, `delivery_status: NOT_SENT` and `delivered: false`;
+no `api_reference` is invented, the audit event records `ACTION_FAILED` /
+`REMINDER_NOT_SENT`, and the dashboard's “successful actions” count does not move.
+The agent-side helpers (`agent_tools.send_payment_reminder`, `retry_payment`) refuse
+the same way, and `check_recovery_status` reads the real case status from the
+database.
+
+### Diagnosis provenance: no language model runs
+
+`POST /api/agent/diagnose` records a diagnosis produced by a deterministic rule
+engine (`backend/app/services/agent_service.py`): the failure cause comes from the
+stored `failure_reason`, the recovery probability is the ML model's stored
+case-level value, and the confidence is a documented rule score. The response says
+so explicitly:
+
+```json
+{
+  "model_used": "deterministic-rules-v1",
+  "diagnosis_source": "DETERMINISTIC_RULES",
+  "llm_used": false,
+  "confidence_source": "deterministic_rule_score",
+  "recovery_probability_source": "ml_model_case_level"
+}
+```
+
+The same provenance is stored in the `DIAGNOSIS_COMPLETED` audit event and returned
+as `diagnosis_provenance` on `GET /api/cases/{case_id}/detail`, so the UI labels
+rule output as rule output. The Policy Engine is given the validated ML probability
+stored on the case — never a number the diagnosis engine claims — and a case with
+no usable ML probability is escalated to a human instead of being authorized on an
+invented value. A real LLM integration replaces `call_llm` and these constants
+together.
 
 ---
 
@@ -376,9 +445,11 @@ Value scoring **ranks eligible candidate actions and never authorizes or execute
 
 - The Policy Engine remains the sole authorization authority; the only policy use here is a
   non-persisting pre-check (`persist=False`) that writes no decision or audit row.
-- Candidates blocked or escalated by policy, terminal cases (`RECOVERED`, `CLOSED`), already
-  recovered payments, and non-executable actions are excluded from the ranking and listed
-  with the reason instead.
+- Candidates blocked or escalated by policy, terminal cases (`RECOVERED`, `CLOSED`), and already
+  recovered payments are excluded from the ranking and listed with the reason instead.
+- Actions this deployment cannot execute are never ranked: they are listed separately under
+  `unavailable_actions` with the missing integration named (`SEND_PAYMENT_REMINDER` needs an
+  email/SMS provider), from the same catalog the Policy Engine authorizes against.
 - The response always states `authorization: {required: true, authority: "policy_engine"}`.
 - Retry limits, approval thresholds, monetary limits, webhook behaviour and provider
   integrations are unchanged by this feature.
@@ -387,7 +458,8 @@ Value scoring **ranks eligible candidate actions and never authorizes or execute
 
 - `GET /api/cases/{case_id}/value` — the full assessment (formula, inputs, provenance,
   gross/cost/net/utility, ranked and excluded candidates, assumptions, limitations).
-- `GET /api/cases/{case_id}/detail` — the same assessment under `value_assessment`.
+- `GET /api/cases/{case_id}/detail` — the same assessment under `value_assessment`, plus
+  `action_availability` (the catalog, so the UI can disable an unavailable action with its reason).
 - Case detail page — an “Estimated Recovery Value” panel showing the formula, inputs and
   assumptions, with estimates visually separated from actual recovered revenue.
 
@@ -422,6 +494,18 @@ only selects the action (`{"action_type": "RETRY", "reason": "..."}`, both optio
   `execution_mode: "MOCK"` (no provider call was made and the placeholder link —
   `https://mock.invalid/...` — cannot be paid). Mock execution is never labelled or
   recorded as a payment.
+- Partial or unrecognised credentials are **not** silently mocked: the request is
+  refused with **503** and `error.code: "PAYMENT_UNCONFIGURED"`, the message names the
+  variable to fix (or says to unset both to run in `MOCK`), and no link — mock or
+  real — is created. Only "no credentials at all" gives mock links.
+- Complete Test Mode credentials with no usable provider client (the `razorpay`
+  package is not installed, or client construction fails) are refused the same way:
+  **503** with `error.code: "PAYMENT_PROVIDER_UNAVAILABLE"`. A deployment that reports
+  `TEST_MODE` never hands back a mock link; the message names the missing piece.
+- Agent tools cannot create links: the `agent_tools.create_payment_link` tool refuses
+  (`POLICY_AUTHORIZATION_REQUIRED`, no link) because links exist only after the Policy
+  Engine authorizes the stored recommendation. It used to return a `mock.invalid`
+  placeholder, which could be mistaken for recovery activity.
 - No secrets are returned; the API returns only the link, its id, amount, mode,
   provider status and the policy decision.
 
@@ -515,7 +599,9 @@ Razorpay only delivers webhooks to a public HTTPS URL. For a demonstration eithe
 2. Confirm they are loaded: `GET /api/config/status` must report
    `"mode": "TEST_MODE"` and `"webhook_configured": true` (the Dashboard banner
    turns from amber `MOCK` to blue `TEST MODE`), and check the startup log line
-   `Razorpay client initialized successfully (Test Mode)`.
+   `Razorpay client initialized (Test Mode)`. A live (`rzp_live_…`) key is refused
+   instead: the endpoint then reports `"mode": "LIVE_REJECTED"`, the startup log
+   says so, and no payment link can be created.
 3. Start the public endpoint (deploy, or `ngrok http 8000`) and set that URL as the
    webhook in the Razorpay dashboard, with the same secret as
    `RAZORPAY_WEBHOOK_SECRET`.
@@ -524,8 +610,9 @@ Razorpay only delivers webhooks to a public HTTPS URL. For a demonstration eithe
    action*).
 5. Execute the recommendation: `POST /api/cases/<CASE-ID>/recovery` with `{}`, or the
    button on the case detail page. The response must say
-   `"execution_mode": "RAZORPAY_TEST_MODE"`; if it says `MOCK`, the credentials are not
-   being picked up and no real link exists.
+   `"execution_mode": "RAZORPAY_TEST_MODE"`; `MOCK` means no credentials are
+   configured and no real link exists. With partial credentials the call is refused
+   with `PAYMENT_UNCONFIGURED` instead — no link is created at all.
 6. Open the returned `payment_link` and pay with a Razorpay **test instrument** (for
    example a test card, or UPI `success@razorpay`). No real money moves.
 7. Watch the case: within a few seconds the webhook settles it — status `RECOVERED`,
@@ -589,21 +676,31 @@ Each simulation produces a realistic distribution of outcomes based on ML predic
 
 Two recovery rates are reported and they are **not** interchangeable:
 
+Three money categories are reported and they are **never** added together into a headline:
+
 | Metric | Formula | Meaning |
 |--------|---------|---------|
 | Case value (fixed denominator) | SUM(amount) over **all** cases | Never moves as statuses change |
-| Money Recovered | SUM(recovered_amount) WHERE recovered_amount > 0 | Rupees actually booked |
-| **Money Recovery Rate** (headline) | Money Recovered / Case value × 100 | How much of the money came back |
+| **Verified Recovered** (`verified_recovered_amount`, headline `total_recovered`) | SUM(recovered_amount) for cases settled by a signature-verified Razorpay webhook | The only money reported as recovered revenue |
+| Simulated (`simulated_recovered_amount`) | SUM(recovered_amount) for `SIM-CASE-*` cases / settling events carrying a simulation id | Simulation bookkeeping. Excluded from every headline; historical rows are left intact |
+| Unattributed (`unattributed_recovered_amount`) | SUM(recovered_amount) for settled cases with no settling audit evidence | A data problem, shown rather than counted as verified |
+| All booked sources (`total_recovered_all_sources`) | verified + simulated + unattributed | Reconciliation figure only |
+| **Money Recovery Rate** (headline) | Verified Recovered / Case value × 100 | How much verified money came back |
+| All-sources rate (`money_recovery_rate_all_sources`) | All booked money / Case value × 100 | Explicitly labelled, never the headline |
 | **Count Recovery Rate** (secondary) | COUNT(status = RECOVERED) / COUNT(cases) × 100 | How many problems were closed |
-| Outstanding | Case value − Money Recovered | Money still to chase |
-| Recovered (7d) / New at risk (7d) | Settled money / value of cases **created** in the window, unsettled | With deltas vs the previous 7 days (`null` when that period was empty) |
-| Recovered provenance | `verified` (signature-verified webhook) · `simulated` · `unattributed` | Simulated and verified rupees are never summed into one unlabelled figure |
+| Outstanding | Case value − all booked recovered | Money still to chase |
+| **Predicted recovery value** (`predicted_recovery_value`) | Σ case.amount × case.recovery_probability over unsettled cases with a stored ML probability | An **estimate**, not revenue and not a forecast of booked money |
+| Recovered (7d) / New at risk (7d) | **Verified** settled money / value of cases **created** in the window, unsettled | With deltas vs the previous 7 days (`null` when that period was empty). `simulated_recovered_7d` and `unattributed_recovered_7d` are reported beside it |
+| Recovered provenance | `verified` (signature-verified webhook) · `simulated` · `unattributed` | Source of every booked rupee |
 | Escalated Cases | COUNT(status = ESCALATED) | |
 | Policy Blocked | COUNT(execution_status = BLOCKED_BY_POLICY) | |
 
 Implementation: `backend/app/services/metrics_service.py` (`get_revenue_metrics`), merged into
 `GET /api/dashboard/stats`. `total_at_risk` and `recovery_rate` are still returned with their old
-meaning so existing callers keep working.
+meaning so existing callers keep working. Every response carries a `metric_definitions` object
+stating what each figure means, and the dashboard/analytics views label verified, simulated and
+predicted money separately (`GET /api/dashboard/charts/daily-recovered` returns `amount` for
+verified plus `simulated_amount` and `unattributed_amount` per day).
 
 ---
 
@@ -612,7 +709,7 @@ meaning so existing callers keep working.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Health check |
-| GET | `/api/config/status` | Payment mode (`TEST_MODE` / `MOCK`) and presence flags — never keys |
+| GET | `/api/config/status` | Payment mode (`TEST_MODE` / `MOCK` / `UNCONFIGURED` / `LIVE_REJECTED`) and presence flags — never keys |
 | GET | `/api/cases` | List cases (paginated, filterable) |
 | GET | `/api/cases/{case_id}` | Get case detail |
 | GET | `/api/cases/{case_id}/detail` | Full case with related entities |
@@ -719,7 +816,7 @@ cd backend
 python -m pytest tests/ -v
 ```
 
-**Current status: 435 tests passing across 14 test files.**
+**Current status: 529 tests passing across 16 test files.**
 
 ### Test Files
 
@@ -843,6 +940,8 @@ python -m pytest tests/ -v
 - ✅ Policy limits enforced on all actions
 - ✅ Recovery execution requires a recorded AI diagnosis and policy authorization
 - ✅ Mock executions are labelled MOCK and never presented as a payment
+- ✅ `TEST_MODE` never falls back to a mock link (missing SDK / failed client init is refused)
+- ✅ Agent tools cannot create payment links or reach the provider
 - ✅ LLM cannot bypass Policy Engine
 - ✅ Amounts come from trusted database, not LLM
 - ✅ Frontend cannot execute payment operations

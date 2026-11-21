@@ -383,8 +383,14 @@ class TestRecoveryService:
         assert action.policy_result == "ESCALATED"
         assert action.execution_status == "ESCALATED"
 
-    def test_execute_recovery_send_reminder(self, db_session, risk_case, active_policy):
-        """Test SEND_PAYMENT_REMINDER action."""
+    def test_reminder_is_refused_as_unavailable(
+        self, db_session, risk_case, active_policy
+    ):
+        """
+        Phase 2.1: a reminder cannot be delivered (no email/SMS integration), so
+        the Policy Engine refuses to authorize it instead of recording a doomed
+        attempt.  Nothing is claimed as sent and no attempt is charged.
+        """
         from app.services.recovery_service import execute_recovery_action
 
         result = execute_recovery_action(
@@ -396,8 +402,154 @@ class TestRecoveryService:
             reason="Gentle reminder",
         )
 
-        assert result["success"] is True
-        assert result["action_executed"] is True
+        assert result["success"] is False
+        assert result["action_executed"] is False
+        assert result["code"] == "ACTION_UNAVAILABLE"
+        assert "not executable in this deployment" in result["error"]
+        assert result["availability"]["availability"] == "SIMULATED_ONLY"
+        assert result["availability"]["executable"] is False
+        assert result["availability"]["required_integration"].startswith(
+            "reminder_delivery_provider"
+        )
+        # No delivery state is invented: nothing was attempted.
+        assert result.get("delivery_status") is None
+        assert result["policy_decision"]["code"] == "ACTION_UNAVAILABLE"
+
+        # The refusal is recorded against the refusal, never as an attempt that was
+        # sent, and the case is untouched.
+        actions = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).all()
+        assert [a.execution_status for a in actions] == ["BLOCKED_BY_POLICY"]
+        assert actions[0].api_reference is None
+        assert db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.event_type == "ACTION_EXECUTED",
+        ).count() == 0
+        db_session.refresh(risk_case)
+        assert risk_case.status == CaseStatus.OPEN.value
+        assert risk_case.attempt_count == 0
+
+    def test_executor_still_records_not_sent_if_it_is_reached(
+        self, db_session, risk_case, active_policy, monkeypatch
+    ):
+        """
+        Defence in depth: authorization normally refuses the reminder, but if an
+        execution ever reaches ``_execute_send_reminder`` it must still record
+        NOT_SENT rather than a delivery.
+        """
+        from app.services import recovery_service
+        from app.schemas.policy import PolicyDecisionResponse
+
+        approval = PolicyDecisionResponse(
+            allowed=True,
+            decision="APPROVED",
+            reason="Authorization bypassed by the test",
+            checks=[],
+            case_id="CASE-TEST-001",
+            proposed_action="SEND_PAYMENT_REMINDER",
+        )
+        monkeypatch.setattr(
+            recovery_service, "evaluate_action", lambda **kwargs: approval
+        )
+
+        result = recovery_service.execute_recovery_action(
+            db=db_session,
+            case_id="CASE-TEST-001",
+            action_type="SEND_PAYMENT_REMINDER",
+            confidence=0.75,
+            recovery_probability=0.65,
+            reason="Gentle reminder",
+        )
+
+        assert result["success"] is False
+        assert result["code"] == "REMINDER_NOT_DELIVERED"
+        assert result["delivery_status"] == "NOT_SENT"
+        assert result["delivered"] is False
+        assert result["provider_called"] is False
+
+        action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id,
+            RecoveryAction.action_type == "SEND_PAYMENT_REMINDER",
+        ).one()
+        assert action.execution_status == "NOT_SENT"
+        assert action.api_reference is None
+
+        audit = db_session.query(AuditEvent).filter(
+            AuditEvent.case_id == risk_case.id,
+            AuditEvent.action == "SEND_PAYMENT_REMINDER",
+            AuditEvent.event_type == "ACTION_FAILED",
+        ).one()
+        assert audit.decision == "REMINDER_NOT_SENT"
+        assert audit.result == "NOT_SENT"
+        assert audit.metadata_["delivered"] is False
+        assert audit.metadata_["delivery_status"] == "NOT_SENT"
+        assert audit.metadata_["channel_configured"] is False
+
+    def test_undeliverable_reminder_does_not_consume_the_reminder_budget(
+        self, db_session, risk_case, active_policy
+    ):
+        """A reminder that never left the system must not spend a reminder budget."""
+        from app.services.policy_engine import check_reminder_limit
+        from app.services.recovery_service import execute_recovery_action
+
+        first = execute_recovery_action(
+            db=db_session,
+            case_id="CASE-TEST-001",
+            action_type="SEND_PAYMENT_REMINDER",
+            confidence=0.75,
+            recovery_probability=0.65,
+            reason="Gentle reminder",
+        )
+        assert first["code"] == "ACTION_UNAVAILABLE"
+
+        check = check_reminder_limit(db_session, risk_case, active_policy)
+        assert check.value == 0.0
+        assert check.passed is True
+
+        # Still refused for the same reason (never delivered), not because a budget
+        # was spent on something that never left the system.
+        second = execute_recovery_action(
+            db=db_session,
+            case_id="CASE-TEST-001",
+            action_type="SEND_PAYMENT_REMINDER",
+            confidence=0.75,
+            recovery_probability=0.65,
+            reason="Second attempt",
+        )
+        assert second["code"] == "ACTION_UNAVAILABLE"
+        assert check_reminder_limit(db_session, risk_case, active_policy).value == 0.0
+
+    def test_simulation_case_reminder_is_recorded_as_simulated(
+        self, db_session, risk_case, active_policy
+    ):
+        """
+        A simulation case is the one context where the simulation-only reminder can
+        run: it is labelled SIMULATED, never DELIVERED.
+        """
+        from app.services.recovery_service import execute_recovery_action
+
+        risk_case.case_id = "SIM-CASE-PHASE2-000001"
+        db_session.commit()
+
+        result = execute_recovery_action(
+            db=db_session,
+            case_id="SIM-CASE-PHASE2-000001",
+            action_type="SEND_PAYMENT_REMINDER",
+            confidence=0.75,
+            recovery_probability=0.65,
+            reason="Simulated reminder",
+        )
+
+        assert result["success"] is False
+        assert result["delivery_status"] == "SIMULATED"
+        assert result["delivered"] is False
+
+        action = db_session.query(RecoveryAction).filter(
+            RecoveryAction.case_id == risk_case.id
+        ).one()
+        assert action.execution_status == "SIMULATED"
+        assert action.api_reference is None
 
     def test_process_payment_success(self, db_session, risk_case):
         """Test processing a successful payment from webhook."""

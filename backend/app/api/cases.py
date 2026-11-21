@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from app.core.auth import require_auth
 from app.db.session import get_db
+from app.services.action_availability import action_availability, is_simulated_case
 from app.services.case_service import get_cases, get_case_by_id
 from app.services.value_service import assess_case_value_by_id
 from app.services.recovery_service import execute_recovery_action, get_recorded_diagnosis
@@ -112,6 +113,22 @@ _RECOVERY_FAILURE_STATUS = {
     "POLICY_BLOCKED": 403,
     "POLICY_ESCALATED": 403,
     "UNSUPPORTED_ACTION": 400,
+    # Live Razorpay credentials were supplied and refused: the service is not
+    # configured for the only provider mode this build supports.
+    "LIVE_MODE_REJECTED": 503,
+    # Razorpay credentials are incomplete or unrecognised: payment execution is
+    # refused rather than silently mocked, so the deployment is not serviceable.
+    "PAYMENT_UNCONFIGURED": 503,
+    # Test Mode credentials are complete but no provider client exists (missing
+    # SDK or failed initialization): refused, never substituted with a mock link.
+    "PAYMENT_PROVIDER_UNAVAILABLE": 503,
+    # A reminder cannot be delivered because no delivery channel is configured:
+    # the deployment cannot perform the action it was asked to perform.
+    "REMINDER_NOT_DELIVERED": 503,
+    # The requested action exists but this deployment cannot execute it (no
+    # integration for it), so the request conflicts with how the service is
+    # configured rather than being a bad request or a server fault.
+    "ACTION_UNAVAILABLE": 409,
     "EXECUTION_FAILED": 502,
 }
 
@@ -161,6 +178,34 @@ def execute_case_recovery(
                      f"recovery action; choose one of: "
                      f"{', '.join(sorted(EXECUTABLE_ACTIONS))}"),
             status_code=409,
+        )
+
+    # Reported before any work is attempted: an action this deployment cannot
+    # perform is refused here with the missing integration named, and the Policy
+    # Engine refuses it too (ACTION_AVAILABILITY), so the two cannot disagree.
+    availability = action_availability(
+        action_type, simulated_case=is_simulated_case(case.case_id)
+    )
+    if not availability["executable"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "error": {
+                    "code": "ACTION_UNAVAILABLE",
+                    "message": (
+                        f"Action '{action_type}' is not executable in this "
+                        f"deployment ({availability['availability']}): "
+                        f"{availability['reason']}"
+                    ),
+                },
+                "case_id": case_id,
+                "action_type": action_type,
+                "availability": availability,
+                "action_executed": False,
+                "delivery_status": None,
+                "delivered": None,
+            },
         )
 
     logger.info(
@@ -221,5 +266,11 @@ def execute_case_recovery(
             # Present for policy refusals, so the caller can show exactly which
             # rule stopped the action.
             "policy_decision": result.get("policy_decision"),
+            # Present for reminder executions: NOT_SENT / SIMULATED mean nothing
+            # was delivered, so the caller must not show the action as sent.
+            "delivery_status": result.get("delivery_status"),
+            "delivered": result.get("delivered"),
+            # Present when the refusal is about what this deployment can execute.
+            "availability": result.get("availability"),
         },
     )

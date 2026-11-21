@@ -26,6 +26,16 @@ class PolicyDecisionResponse(BaseModel):
     checks: List[PolicyCheck] = Field(..., description="List of policy checks performed")
     case_id: str = Field(..., description="Case ID being checked")
     proposed_action: str = Field(..., description="Action that was proposed")
+    #: Machine-readable refusal code, when the decision has one.  Refusals of
+    #: actions that this deployment cannot execute use ACTION_UNAVAILABLE, so a
+    #: caller never has to parse the reason string.
+    code: Optional[str] = Field(None, description="Machine-readable refusal code")
+    #: Whether the proposed action can be executed here at all, and why not.
+    #: Recomputed from the same catalog the value ranking uses, so a recommendation
+    #: and an authorization cannot disagree about availability.
+    action_availability: Optional[dict] = Field(
+        None, description="Availability of the proposed action in this deployment"
+    )
 
 
 class PolicyConfigResponse(BaseModel):

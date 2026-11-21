@@ -26,8 +26,64 @@ from app.models import (
     AuditEventType,
 )
 from app.services.policy_engine import evaluate_action
-from app.services.razorpay_service import create_payment_link
+from app.services.razorpay_service import (
+    PaymentProviderUnavailableError,
+    create_payment_link,
+)
+# Addressed through the module (not copied names) so the delivery channel check
+# here is always the same one action_availability and the Policy Engine report.
+from app.services import action_availability
+from app.services.simulation_service import SIMULATION_CASE_PREFIX
 from app.utils.logging import logger
+
+
+# Reminder delivery outcomes.  A reminder counts as sent only when a delivery
+# channel reports that the message actually left the system, so the recorded
+# state distinguishes the three possibilities instead of collapsing every
+# outcome into SUCCESS:
+#
+#   NOT_SENT  - no delivery channel is configured; nothing was delivered.
+#   SIMULATED - the case is simulation data; nothing was delivered.
+#   DELIVERED - a provider confirmed delivery (requires a configured channel;
+#               none is integrated in this build, so this state is not produced
+#               yet and must not be faked).
+REMINDER_NOT_SENT = "NOT_SENT"
+REMINDER_SIMULATED = "SIMULATED"
+REMINDER_DELIVERED = "DELIVERED"
+
+
+def _reminder_delivery(case: RevenueRiskCase) -> tuple[str, str]:
+    """
+    Return ``(delivery_status, reason)`` for a reminder execution.
+
+    No email/SMS provider is integrated in this build, so a real case can never
+    produce a delivered reminder.  Simulation cases are recorded as SIMULATED,
+    everything else as NOT_SENT, and neither is reported as a sent reminder.
+    A future channel must report a provider message id before DELIVERED may be
+    recorded.
+
+    The channel check goes through ``action_availability``, so this executor and
+    the Policy Engine (which now refuses a reminder unless it is executable) use
+    the same declaration of capability.
+    """
+    if str(case.case_id).startswith(SIMULATION_CASE_PREFIX):
+        return (
+            REMINDER_SIMULATED,
+            "the case is simulation data, so no message was sent to a customer",
+        )
+    if not action_availability.reminder_delivery_available():
+        return (
+            REMINDER_NOT_SENT,
+            "no reminder delivery channel (email/SMS provider) is configured in this "
+            "deployment",
+        )
+    # A channel is declared, but nothing confirms delivery here.  Claiming
+    # DELIVERED without a provider message id would be exactly the fabrication
+    # this state machine exists to prevent.
+    return (
+        REMINDER_NOT_SENT,
+        "the configured reminder channel reported no delivery confirmation",
+    )
 
 
 def execute_recovery_action(
@@ -151,11 +207,18 @@ def execute_recovery_action(
         
         return {
             "success": False,
-            "code": "POLICY_ESCALATED" if escalated else "POLICY_BLOCKED",
+            # An action this deployment cannot execute at all is reported as such,
+            # so the caller can explain *why* instead of parsing the reason text.
+            "code": (
+                "ACTION_UNAVAILABLE"
+                if getattr(policy_result, "code", None) == "ACTION_UNAVAILABLE"
+                else ("POLICY_ESCALATED" if escalated else "POLICY_BLOCKED")
+            ),
             "error": (f"Policy escalated: {policy_result.reason}" if escalated
                       else f"Policy blocked: {policy_result.reason}"),
             "action_executed": False,
             "escalated": escalated,
+            "availability": getattr(policy_result, "action_availability", None),
             "policy_decision": policy_result.model_dump(),
         }
     
@@ -195,7 +258,46 @@ def execute_recovery_action(
             }
         
         return result
-        
+
+    except PaymentProviderUnavailableError as e:
+        # The payment layer refuses unusable credentials: live keys, partial or
+        # unrecognised ones, and Test Mode credentials with no usable client.
+        # Record the refusal and leave the case exactly as it was: nothing was
+        # executed, no link exists (not even a mock one), and the attempt must not
+        # consume a policy budget.
+        logger.error(
+            f"Refused to execute {action_type} for case {case_id}: {e}"
+        )
+
+        db.add(RecoveryAction(
+            case_id=case.id,
+            action_type=action_type,
+            reason=reason,
+            confidence=confidence,
+            policy_result="APPROVED",
+            execution_status="REFUSED",
+        ))
+
+        db.add(AuditEvent(
+            case_id=case.id,
+            event_type=AuditEventType.ACTION_FAILED.value,
+            actor="recovery_service",
+            decision=e.audit_decision,
+            reason=str(e),
+            confidence=confidence,
+            action=action_type,
+            result="REFUSED",
+        ))
+
+        db.commit()
+
+        return {
+            "success": False,
+            "code": e.code,
+            "error": str(e),
+            "action_executed": False,
+        }
+
     except Exception as e:
         logger.error(f"Failed to execute action {action_type} for case {case_id}: {e}")
         
@@ -429,44 +531,69 @@ def _execute_send_reminder(
 ) -> Dict[str, Any]:
     """
     Execute SEND_PAYMENT_REMINDER action.
-    
-    This sends a payment reminder to the customer.
+
+    A reminder is only a successful action once the customer has actually
+    received it.  This build has no delivery channel, so the execution is
+    recorded as NOT_SENT (or SIMULATED for simulation data): no message is
+    claimed, no delivery reference is invented, and the reminder / recovery
+    budgets are not consumed (the Policy Engine excludes NOT_SENT rows).
     """
-    logger.info(f"Sending payment reminder for case {case.case_id}")
-    
-    # Create recovery action record
+    delivery_status, delivery_reason = _reminder_delivery(case)
+    channel = action_availability.reminder_delivery_channel()
+
+    logger.warning(
+        f"Payment reminder for case {case.case_id} not delivered "
+        f"[{delivery_status}]: {delivery_reason}"
+    )
+
+    # The attempt is recorded so the audit trail shows what was tried, but it is
+    # explicitly not a delivery: no api_reference, no SUCCESS status.
     recovery_action = RecoveryAction(
         case_id=case.id,
         action_type="SEND_PAYMENT_REMINDER",
         reason=reason,
         confidence=confidence,
         policy_result="APPROVED",
-        execution_status="SUCCESS",
-        api_reference=f"reminder_{case.case_id}",
+        execution_status=delivery_status,
+        api_reference=None,
     )
     db.add(recovery_action)
-    
-    # Create audit event
+
     audit_event = AuditEvent(
         case_id=case.id,
-        event_type=AuditEventType.ACTION_EXECUTED.value,
+        event_type=AuditEventType.ACTION_FAILED.value,
         actor="recovery_service",
-        decision="APPROVED",
-        reason="Payment reminder sent",
+        decision=f"REMINDER_{delivery_status}",
+        reason=f"Payment reminder not delivered: {delivery_reason}",
         confidence=confidence,
         action="SEND_PAYMENT_REMINDER",
-        result="SUCCESS",
+        result=delivery_status,
+        metadata_={
+            "delivery_status": delivery_status,
+            "delivered": False,
+            "delivery_provider": channel,
+            "channel_configured": channel is not None,
+            "recipient_contacted": False,
+            "simulated": delivery_status == REMINDER_SIMULATED,
+        },
     )
     db.add(audit_event)
-    
+
     db.commit()
-    
-    logger.info(f"Payment reminder sent for case {case.case_id}")
-    
+
     return {
-        "success": True,
-        "action_executed": True,
-        "message": "Payment reminder sent",
+        "success": False,
+        "code": "REMINDER_NOT_DELIVERED",
+        "error": (
+            f"Payment reminder was not delivered: {delivery_reason}. No message "
+            f"was sent, and the attempt does not consume a reminder or recovery "
+            f"budget."
+        ),
+        "action_executed": False,
+        "delivery_status": delivery_status,
+        "delivered": False,
+        "provider_called": False,
+        "mock": False,
     }
 
 

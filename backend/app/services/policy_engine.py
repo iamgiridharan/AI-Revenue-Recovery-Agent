@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.schemas.agent import RecoveryAction as RecoveryActionEnum
 from app.schemas.policy import PolicyCheck, PolicyDecisionResponse
+from app.services.action_availability import action_availability, is_simulated_case
 from app.utils.logging import logger
 
 
@@ -42,9 +43,15 @@ DEFAULT_POLICY_CONFIG = {
 # A policy-blocked or escalated action was never carried out, so counting it as
 # an attempt would consume the case's recovery budget without any recovery
 # having been tried.
+#
+# "NOT_SENT" is a reminder attempt that was never delivered (no delivery channel
+# is configured).  Nothing left the system, so it must not spend the reminder or
+# total-attempt budget: budgets track successful deliveries and executions, not
+# attempts the system could not complete.
 _NON_EXECUTED_ACTION_STATES = [
     RecoveryOutcome.BLOCKED_BY_POLICY.value,
     RecoveryOutcome.ESCALATED.value,
+    "NOT_SENT",
 ]
 
 
@@ -294,6 +301,45 @@ def check_human_review_required(case: RevenueRiskCase) -> PolicyCheck:
     )
 
 
+def check_action_availability(case: RevenueRiskCase, proposed_action: str) -> PolicyCheck:
+    """
+    Check that the proposed action can actually be executed in this deployment.
+
+    The answer comes from ``action_availability``, the same catalog the value
+    ranking uses, so a recommendation and an authorization cannot disagree: an
+    action that the ranking refuses to recommend can never be approved here.
+
+    This is a hard stop for a real case.  A reminder needs an email/SMS
+    integration that this build does not have, so authorizing one for a customer
+    would authorize an action that can only produce ``NOT_SENT``.  A named human
+    reviewer cannot override it either (``authorized_by`` releases *autonomy*
+    thresholds, never missing integration), matching the stance taken for settled
+    cases and exhausted budgets.
+
+    Simulation data is the one exception, and it is not a recovery promise: a
+    ``SIMULATED_ONLY`` action may still be authorized for a ``SIM-CASE-*`` case
+    because the simulation pipeline is exactly the supported path for it.  The
+    check still reports ``executable: False``, so nothing presents it as a real
+    delivery.
+    """
+    simulated_case = is_simulated_case(case.case_id)
+    availability = action_availability(proposed_action, simulated_case=simulated_case)
+    passed = bool(availability["executable"]) or (
+        simulated_case and bool(availability["available_in_simulation"])
+    )
+
+    return PolicyCheck(
+        rule="ACTION_AVAILABILITY",
+        passed=passed,
+        reason=None if passed else (
+            f"Action '{proposed_action}' is not executable in this deployment: "
+            f"{availability['reason']}"
+        ),
+        value=0.0 if passed else 1.0,
+        limit=0.0,
+    )
+
+
 def evaluate_action(
     db: Session,
     case_id: str,
@@ -411,6 +457,22 @@ def evaluate_action(
         return _create_decision(db, case, proposed_action, "BLOCKED",
                                "Recovery attempt limit reached", checks, confidence, recovery_probability, persist=persist)
     
+    # Check that the action can be carried out at all.  This is a hard stop that
+    # comes *after* the budget checks (so an exhausted budget is still reported as
+    # the reason) and before the autonomy thresholds (which a reviewer may
+    # override): missing integration is never a reviewer's decision.
+    availability = action_availability(
+        proposed_action, simulated_case=is_simulated_case(case.case_id)
+    )
+    check = check_action_availability(case, proposed_action)
+    checks.append(check)
+    if not check.passed:
+        return _create_decision(
+            db, case, proposed_action, "BLOCKED", check.reason, checks,
+            confidence, recovery_probability, persist=persist,
+            code="ACTION_UNAVAILABLE", availability=availability,
+        )
+
     # The checks below gate *autonomous* action.  A named human reviewer who
     # authorizes the action overrides them, so a failure is recorded in the stored
     # checks and in the decision reason rather than sending the case back to a
@@ -462,7 +524,8 @@ def evaluate_action(
 
     return _create_decision(db, case, proposed_action, "APPROVED",
                            reason, checks, confidence, recovery_probability, persist=persist,
-                           authorized_by=authorized_by, overridden=overridden)
+                           authorized_by=authorized_by, overridden=overridden,
+                           availability=availability)
 
 
 def _create_decision(
@@ -477,16 +540,22 @@ def _create_decision(
     persist: bool = True,
     authorized_by: Optional[str] = None,
     overridden: Optional[List[str]] = None,
+    code: Optional[str] = None,
+    availability: Optional[dict] = None,
 ) -> PolicyDecisionResponse:
     """Create a policy decision and, unless ``persist`` is False, store it."""
     if persist:
         # Who made the decision: the engine alone, or a named human whose
         # authorization the engine recorded.  Both are visible in the commit trail.
+        # Action availability is recorded too, so a refusal can be explained after
+        # the deployment changes.
         metadata = None
-        if authorized_by:
+        if authorized_by or availability or code:
             metadata = {
                 "authorized_by": authorized_by,
                 "overridden_rules": list(overridden or []),
+                "action_availability": availability,
+                "code": code,
             }
 
         # Store decision in database
@@ -529,4 +598,6 @@ def _create_decision(
         checks=checks,
         case_id=case.case_id,
         proposed_action=proposed_action,
+        code=code,
+        action_availability=availability,
     )

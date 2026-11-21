@@ -25,10 +25,59 @@ const TIMELINE_STEPS = [
 // A case the autonomous flow must not act on again.
 const SETTLED_STATUSES = new Set(['RECOVERED', 'CLOSED']);
 
-// Actions the recovery service can actually execute. The remaining agent actions
+// Actions the recovery service has an executor for. The remaining agent actions
 // (NO_ACTION, WAIT_AND_RETRY, ESCALATE_TO_HUMAN, MARK_UNRECOVERABLE) are
 // decisions rather than executable recovery attempts.
-const EXECUTABLE_ACTIONS = ['CREATE_PAYMENT_LINK', 'RETRY', 'SEND_PAYMENT_REMINDER'];
+const EXECUTOR_ACTIONS = ['CREATE_PAYMENT_LINK', 'RETRY', 'SEND_PAYMENT_REMINDER'];
+
+// Used only if the API does not report availability (an older payload).
+const AVAILABILITY_FALLBACK = {
+  CREATE_PAYMENT_LINK: true,
+  RETRY: true,
+  SEND_PAYMENT_REMINDER: false, // no delivery channel is integrated
+};
+
+/**
+ * Availability of one action, as reported by the backend catalog
+ * (`action_availability`).
+ *
+ * The backend is the single source of truth for what can be executed here: a
+ * reminder needs an email/SMS provider, so it is reported as SIMULATED_ONLY and
+ * must never be offered as an executable recovery action.
+ */
+function availabilityEntry(action, availability) {
+  const found = (availability || []).find((entry) => entry.action === action);
+  if (found) return found;
+  const executable = AVAILABILITY_FALLBACK[action] === true;
+  return {
+    action,
+    availability: executable ? 'EXECUTABLE' : 'UNAVAILABLE',
+    executable,
+    reason: executable
+      ? 'executable'
+      : 'availability was not reported by the API',
+    required_integration: null,
+  };
+}
+
+function executableActionsFrom(availability) {
+  return EXECUTOR_ACTIONS.filter((action) => availabilityEntry(action, availability).executable);
+}
+
+function UnavailableActionNote({ action, availability }) {
+  const entry = availabilityEntry(action, availability);
+  if (entry.executable) return null;
+  return (
+    <p className="text-[11px] text-amber-700">
+      <span className="font-semibold">{action.replace(/_/g, ' ')}</span>{' '}
+      <span className="font-mono text-[10px] uppercase">{entry.availability}</span>
+      {' — '}{entry.reason}
+      {entry.required_integration && (
+        <span className="text-amber-600"> (needs {entry.required_integration})</span>
+      )}
+    </p>
+  );
+}
 
 /**
  * Run the AI agent on this case.
@@ -37,9 +86,44 @@ const EXECUTABLE_ACTIONS = ['CREATE_PAYMENT_LINK', 'RETRY', 'SEND_PAYMENT_REMIND
  * a validated recommendation. It never executes a payment: the recommendation is
  * authorised by the Policy Engine when an action is executed below.
  */
-function DiagnosisPanel({ caseId, status, onDiagnosed }) {
+/**
+ * Says where a diagnosis came from. In this build no language model runs, so the
+ * response reports `diagnosis_source: DETERMINISTIC_RULES` and `llm_used: false`.
+ * Showing that explicitly is what keeps rule output from reading as an LLM answer.
+ */
+function DiagnosisProvenance({ provenance }) {
+  if (!provenance) return null;
+  const ruleBased = provenance.llm_used === false;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className={`text-[10px] font-bold tracking-wide px-2 py-0.5 rounded border ${
+        ruleBased
+          ? 'bg-slate-50 text-slate-700 border-slate-300'
+          : 'bg-violet-50 text-violet-700 border-violet-200'
+      }`}>
+        {ruleBased ? 'DETERMINISTIC RULES' : (provenance.diagnosis_source || 'UNKNOWN SOURCE')}
+      </span>
+      <span className="text-[11px] text-gray-500">
+        {ruleBased
+          ? 'No language model ran: the diagnosis is rule-based and the probability is the ML model\u2019s stored case-level output.'
+          : `Produced by ${provenance.diagnosis_source || 'an unrecorded engine'}.`}
+      </span>
+      {provenance.recovery_probability_source && (
+        <span className="text-[11px] text-gray-400">
+          probability: {provenance.recovery_probability_source}
+        </span>
+      )}
+      {provenance.confidence_source && (
+        <span className="text-[11px] text-gray-400">confidence: {provenance.confidence_source}</span>
+      )}
+    </div>
+  );
+}
+
+function DiagnosisPanel({ caseId, status, availability, onDiagnosed }) {
   const [running, setRunning] = useState(false);
   const [recommendation, setRecommendation] = useState(null);
+  const [provenance, setProvenance] = useState(null);
   const [error, setError] = useState(null);
 
   const settled = SETTLED_STATUSES.has(status);
@@ -48,9 +132,16 @@ function DiagnosisPanel({ caseId, status, onDiagnosed }) {
     setRunning(true);
     setError(null);
     setRecommendation(null);
+    setProvenance(null);
     try {
       const res = await diagnoseCase(caseId);
       setRecommendation(res.data);
+      setProvenance({
+        diagnosis_source: res.diagnosis_source,
+        llm_used: res.llm_used,
+        confidence_source: res.confidence_source,
+        recovery_probability_source: res.recovery_probability_source,
+      });
       if (onDiagnosed) onDiagnosed();
     } catch (err) {
       setError(err.message);
@@ -62,9 +153,12 @@ function DiagnosisPanel({ caseId, status, onDiagnosed }) {
   return (
     <Section title="AI Agent Diagnosis">
       <p className="text-sm text-gray-500 mb-3">
-        Runs the agent on this case and records its recommendation (diagnosis,
-        action, confidence, recovery probability). The recommendation is advisory:
-        the Policy Engine authorises the action, never the agent.
+        Records a diagnosis and recommendation for this case (diagnosis, action,
+        confidence, recovery probability). No language model runs in this build:
+        the diagnosis is produced by deterministic rules from the stored failure
+        reason and the ML prediction, and that provenance is shown with the
+        result. The recommendation is advisory: the Policy Engine authorises the
+        action, never the agent.
       </p>
 
       <button
@@ -96,6 +190,8 @@ function DiagnosisPanel({ caseId, status, onDiagnosed }) {
             </span>
           </div>
 
+          <DiagnosisProvenance provenance={provenance} />
+
           <p className="text-sm text-gray-700 leading-relaxed">{recommendation.diagnosis}</p>
           {recommendation.reasoning_summary && (
             <p className="text-xs text-gray-500">{recommendation.reasoning_summary}</p>
@@ -108,10 +204,14 @@ function DiagnosisPanel({ caseId, status, onDiagnosed }) {
               <p className="text-xs text-gray-600">{recommendation.customer_message}</p>
             </div>
           )}
-          {!EXECUTABLE_ACTIONS.includes(recommendation.recommended_action) && (
+          {!availabilityEntry(recommendation.recommended_action, availability).executable && (
             <p className="text-[11px] text-amber-700">
-              This recommendation is a decision, not an executable recovery action.
-              Pick an executable action below to attempt recovery.
+              {EXECUTOR_ACTIONS.includes(recommendation.recommended_action)
+                ? `This recommendation cannot be executed in this deployment: ${
+                    availabilityEntry(recommendation.recommended_action, availability).reason
+                  }`
+                : 'This recommendation is a decision, not an executable recovery action.'}
+              {' '}Pick an executable action below to attempt recovery.
             </p>
           )}
           <p className="text-[11px] text-gray-400">
@@ -134,10 +234,11 @@ function DiagnosisPanel({ caseId, status, onDiagnosed }) {
  * was made and the link cannot be paid - shown explicitly rather than as a
  * payment.
  */
-function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
-  const recordedExecutable = EXECUTABLE_ACTIONS.includes(recommendedAction);
+function RecoveryExecution({ caseId, status, recommendedAction, availability, onExecuted }) {
+  const executable = executableActionsFrom(availability);
+  const recordedExecutable = executable.includes(recommendedAction);
   const [actionType, setActionType] = useState(
-    recordedExecutable ? recommendedAction : 'CREATE_PAYMENT_LINK'
+    recordedExecutable ? recommendedAction : (executable[0] || '')
   );
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
@@ -145,9 +246,11 @@ function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
 
   const settled = SETTLED_STATUSES.has(status);
   const escalated = status === 'ESCALATED';
-  const blocked = settled || escalated;
+  const selectedExecutable = executable.includes(actionType);
+  const blocked = settled || escalated || !selectedExecutable;
 
   async function handleExecute() {
+    if (!selectedExecutable) return;
     setRunning(true);
     setError(null);
     setResult(null);
@@ -171,29 +274,45 @@ function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
         the recorded AI diagnosis.
       </p>
 
-      {/* Action picker */}
+      {/* Action picker: unavailable actions are shown, disabled, with the reason */}
       <div className="flex flex-wrap gap-2 mb-2">
-        {EXECUTABLE_ACTIONS.map((action) => {
+        {EXECUTOR_ACTIONS.map((action) => {
           const selected = actionType === action;
+          const entry = availabilityEntry(action, availability);
           return (
             <button
               key={action}
               type="button"
               onClick={() => setActionType(action)}
-              disabled={blocked}
+              disabled={settled || escalated || !entry.executable}
+              title={entry.executable ? undefined : entry.reason}
               className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                 selected
                   ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
                   : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-              } disabled:opacity-40`}
+              } disabled:opacity-40 disabled:cursor-not-allowed`}
             >
               {action.replace(/_/g, ' ')}
               {action === recommendedAction && (
                 <span className="ml-1 text-[10px] text-gray-400">(AI pick)</span>
               )}
+              {!entry.executable && (
+                <span className="ml-1 text-[10px] text-amber-600">unavailable</span>
+              )}
             </button>
           );
         })}
+      </div>
+
+      {/* Why an action cannot be chosen */}
+      <div className="space-y-0.5 mb-2">
+        {EXECUTOR_ACTIONS.map((action) => (
+          <UnavailableActionNote
+            key={action}
+            action={action}
+            availability={availability}
+          />
+        ))}
       </div>
 
       <p className="text-xs text-gray-500 mb-3">
@@ -225,7 +344,9 @@ function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
           ? 'Case already settled'
           : escalated
             ? 'Awaiting human review'
-            : `Execute ${actionType.replace(/_/g, ' ').toLowerCase()}`}
+            : !selectedExecutable
+              ? 'No executable action available'
+              : `Execute ${actionType.replace(/_/g, ' ').toLowerCase()}`}
       </button>
 
       {error && (
@@ -293,9 +414,10 @@ function RecoveryExecution({ caseId, status, recommendedAction, onExecuted }) {
  * always the failed transaction's and the confidence is always the recorded
  * diagnosis's.
  */
-function ReviewPanel({ caseId, status, recommendedAction, onReviewed }) {
+function ReviewPanel({ caseId, status, recommendedAction, availability, onReviewed }) {
   const escalated = status === 'ESCALATED';
-  const recordedExecutable = EXECUTABLE_ACTIONS.includes(recommendedAction);
+  const executable = executableActionsFrom(availability);
+  const recordedExecutable = executable.includes(recommendedAction);
 
   const [reviewer, setReviewer] = useState(() => {
     try {
@@ -306,7 +428,7 @@ function ReviewPanel({ caseId, status, recommendedAction, onReviewed }) {
   });
   const [note, setNote] = useState('');
   const [actionType, setActionType] = useState(
-    recordedExecutable ? recommendedAction : 'CREATE_PAYMENT_LINK'
+    recordedExecutable ? recommendedAction : (executable[0] || '')
   );
   const [pending, setPending] = useState(null);
   const [result, setResult] = useState(null);
@@ -390,27 +512,42 @@ function ReviewPanel({ caseId, status, recommendedAction, onReviewed }) {
         Action to authorize
       </p>
       <div className="flex flex-wrap gap-2 mb-2">
-        {EXECUTABLE_ACTIONS.map((action) => {
+        {EXECUTOR_ACTIONS.map((action) => {
           const selected = actionType === action;
+          const entry = availabilityEntry(action, availability);
           return (
             <button
               key={action}
               type="button"
               onClick={() => setActionType(action)}
-              disabled={pending !== null}
+              disabled={pending !== null || !entry.executable}
+              title={entry.executable ? undefined : entry.reason}
               className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                 selected
                   ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
                   : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
-              } disabled:opacity-40`}
+              } disabled:opacity-40 disabled:cursor-not-allowed`}
             >
               {action.replace(/_/g, ' ')}
               {action === recommendedAction && (
                 <span className="ml-1 text-[10px] text-gray-400">(AI pick)</span>
               )}
+              {!entry.executable && (
+                <span className="ml-1 text-[10px] text-amber-600">unavailable</span>
+              )}
             </button>
           );
         })}
+      </div>
+
+      <div className="space-y-0.5 mb-2">
+        {EXECUTOR_ACTIONS.map((action) => (
+          <UnavailableActionNote
+            key={action}
+            action={action}
+            availability={availability}
+          />
+        ))}
       </div>
       <p className="text-xs text-gray-500 mb-3">
         {recommendedAction
@@ -639,6 +776,7 @@ function ValueAssessment({ assessment }) {
   const penalties = assessment.penalties || {};
   const candidates = assessment.candidates || [];
   const excluded = assessment.excluded_candidates || [];
+  const unavailable = assessment.unavailable_actions || [];
 
   return (
     <Section title="Estimated Recovery Value">
@@ -760,6 +898,31 @@ function ValueAssessment({ assessment }) {
         </div>
       )}
 
+      {/* Supported actions this deployment cannot execute, and why */}
+      {unavailable.length > 0 && (
+        <div className="mb-3">
+          <p className="text-xs font-semibold text-gray-600 mb-2 uppercase tracking-wide">
+            Not executable in this deployment
+          </p>
+          <div className="space-y-1">
+            {unavailable.map((entry) => (
+              <div key={entry.action} className="text-xs text-gray-500">
+                <span className="font-medium text-gray-700">
+                  {entry.action.replace(/_/g, ' ')}
+                </span>{' '}
+                <span className="font-mono text-[10px] uppercase text-amber-700">
+                  {entry.availability}
+                </span>
+                {' — '}{entry.reason}
+                {entry.required_integration && (
+                  <span className="text-amber-600"> (needs {entry.required_integration})</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Assumptions and limitations, so the estimate is not over-read */}
       {assessment.assumptions && assessment.assumptions.length > 0 && (
         <div className="mb-2">
@@ -831,7 +994,16 @@ export default function CaseDetail() {
 
   if (!data) return null;
 
-  const { case: caseData, customer, transaction, recovery_actions, audit_events, value_assessment } = data;
+  const {
+    case: caseData,
+    customer,
+    transaction,
+    recovery_actions,
+    audit_events,
+    value_assessment,
+    diagnosis_provenance,
+    action_availability,
+  } = data;
 
   // Keep the estimate and the actual recovered revenue visibly distinct.
   const valueAssessment = value_assessment
@@ -882,6 +1054,7 @@ export default function CaseDetail() {
           <DiagnosisPanel
             caseId={caseData.case_id}
             status={caseData.status}
+            availability={action_availability}
             onDiagnosed={fetchDetail}
           />
 
@@ -893,6 +1066,7 @@ export default function CaseDetail() {
             caseId={caseData.case_id}
             status={caseData.status}
             recommendedAction={caseData.recommended_action}
+            availability={action_availability}
             onReviewed={fetchDetail}
           />
 
@@ -901,13 +1075,17 @@ export default function CaseDetail() {
             caseId={caseData.case_id}
             status={caseData.status}
             recommendedAction={caseData.recommended_action}
+            availability={action_availability}
             onExecuted={fetchDetail}
           />
 
           {/* Diagnosis */}
           {caseData.diagnosis && (
-            <Section title="AI Diagnosis">
-              <p className="text-sm text-gray-700 leading-relaxed">{caseData.diagnosis}</p>
+            <Section title="Recorded Diagnosis">
+              <div className="space-y-2">
+                <DiagnosisProvenance provenance={diagnosis_provenance} />
+                <p className="text-sm text-gray-700 leading-relaxed">{caseData.diagnosis}</p>
+              </div>
             </Section>
           )}
 
@@ -937,7 +1115,9 @@ export default function CaseDetail() {
                       </span>
                       <span className={`text-xs px-2 py-0.5 rounded ${
                         action.execution_status === 'SUCCESS' ? 'bg-green-50 text-green-700' :
-                        action.execution_status === 'BLOCKED_BY_POLICY' ? 'bg-amber-50 text-amber-700' :
+                        action.execution_status === 'NOT_SENT' || action.execution_status === 'SIMULATED'
+                          ? 'bg-amber-50 text-amber-700'
+                        : action.execution_status === 'BLOCKED_BY_POLICY' ? 'bg-amber-50 text-amber-700' :
                         action.execution_status === 'FAILED' ? 'bg-red-50 text-red-700' :
                         'bg-gray-50 text-gray-600'
                       }`}>

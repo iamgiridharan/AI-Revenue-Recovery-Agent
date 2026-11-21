@@ -19,8 +19,11 @@ env/
 node_modules/
 frontend/dist/
 
-# Personal notes (local only — never committed)
-docs/
+# Personal notes (local only — never committed).  docs/ stays ignored except
+# for the one project document that is tracked deliberately.
+docs/*
+!docs/PROJECT_STATUS.md
+NOTES_*.md
 
 # Tooling / local agent state
 .freebuff/

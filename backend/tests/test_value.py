@@ -147,8 +147,10 @@ class TestZeroValues:
 
         assert assessment["inputs"]["payment_amount"] == 0.0
         assert assessment["expected_gross_recovery"] == 0.0
-        assert assessment["intervention_cost"] == 1.0  # cheapest eligible candidate
-        assert assessment["expected_net_recovery"] == -1.0
+        # Cheapest *executable* candidate: the reminder (cost 1.0) is no longer
+        # ranked because no delivery channel exists.
+        assert assessment["intervention_cost"] == 5.0
+        assert assessment["expected_net_recovery"] == -5.0
         # Every candidate is still ranked and remains inspectable
         assert len(assessment["candidates"]) == len(EXECUTABLE_ACTIONS)
 
@@ -356,8 +358,8 @@ class TestNetRecoveryArithmetic:
         assessment = assess_case_value(db_session, value_case, costs=COSTS)
 
         assert assessment["expected_gross_recovery"] == 2000.0
-        assert assessment["intervention_cost"] == 1.0
-        assert assessment["expected_net_recovery"] == 1999.0
+        assert assessment["intervention_cost"] == 5.0  # cheapest executable candidate
+        assert assessment["expected_net_recovery"] == 1995.0
         assert assessment["expected_net_recovery"] == (
             assessment["expected_gross_recovery"] - assessment["intervention_cost"]
         )
@@ -371,10 +373,13 @@ class TestNetRecoveryArithmetic:
         assessment = assess_case_value(db_session, value_case, costs=COSTS)
 
         assert assessment["inputs"]["recovery_probability_is_action_specific"] is False
-        assert assessment["recommended_action"] == "SEND_PAYMENT_REMINDER"
+        assert assessment["recommended_action"] == "RETRY"
         assert [c["action"] for c in assessment["candidates"]] == [
-            "SEND_PAYMENT_REMINDER", "RETRY", "CREATE_PAYMENT_LINK",
+            "RETRY", "CREATE_PAYMENT_LINK",
         ]
+        # The cheapest action is the reminder, but it is not executable here, so it
+        # is never recommended even though its cost is lowest.
+        assert "SEND_PAYMENT_REMINDER" not in [c["action"] for c in assessment["candidates"]]
 
     def test_caller_supplied_action_probabilities_are_labelled(self, db_session, value_case):
         assessment = assess_case_value(
@@ -407,7 +412,7 @@ class TestCandidatesAndTies:
         assessment = assess_case_value(db_session, value_case, costs=equal_costs)
 
         assert [c["action"] for c in assessment["candidates"]] == list(EXECUTABLE_ACTIONS)
-        assert [c["rank"] for c in assessment["candidates"]] == [1, 2, 3]
+        assert [c["rank"] for c in assessment["candidates"]] == [1, 2]
         assert assessment["recommended_action"] == EXECUTABLE_ACTIONS[0]
 
     def test_ranking_is_deterministic_across_calls(self, db_session, value_case):
@@ -574,6 +579,11 @@ class TestNeverAuthorizes:
                 "authorizes or executes an action. The Policy Engine is "
                 "consulted again (and recorded) when an action is executed."
             ),
+            "availability_note": (
+                "executable_actions and unavailable_actions come from the same "
+                "catalog the Policy Engine uses (ACTION_AVAILABILITY), so an "
+                "action excluded here cannot be approved there."
+            ),
         }
 
     def test_execution_still_records_policy_authorization(self, db_session, value_case):
@@ -597,7 +607,19 @@ class TestNeverAuthorizes:
             recovery_probability=0.8,
         )
 
-        assert result["action_executed"] is True
+        # The value ranking picks the cheapest action, which is the reminder.  A
+        # reminder is policy-authorized here but cannot be delivered (no delivery
+        # channel exists), so the recorded outcome is NOT_SENT — never a silent
+        # success.  What this test guards is that the execution went through the
+        # Policy Engine either way.
+        if recommended == "SEND_PAYMENT_REMINDER":
+            assert result["success"] is False
+            assert result["code"] == "REMINDER_NOT_DELIVERED"
+            assert result["action_executed"] is False
+            assert result["delivered"] is False
+        else:
+            assert result["action_executed"] is True
+
         decisions = db_session.query(PolicyDecision).all()
         assert len(decisions) == 1
         assert decisions[0].proposed_action == recommended
