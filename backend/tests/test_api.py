@@ -62,6 +62,7 @@ def _fake_settings(**overrides):
         "RAZORPAY_KEY_ID": "",
         "RAZORPAY_KEY_SECRET": "",
         "RAZORPAY_WEBHOOK_SECRET": "",
+        "RAZORPAY_LIVE_KEY_REJECTED": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -103,17 +104,37 @@ class TestConfigStatusEndpoint:
         assert "super-secret-value" not in body
         assert "whsec-secret-value" not in body
 
-    def test_partial_credentials_stay_mock(self, client, monkeypatch):
-        """A key id without its secret cannot reach Razorpay, so it stays MOCK."""
+    def test_partial_credentials_are_reported_unconfigured(self, client, monkeypatch):
+        """
+        A key id without its secret cannot reach Razorpay.  That is reported as
+        UNCONFIGURED (a half-configured deployment), not silently as MOCK, so the
+        missing secret is visible instead of hidden behind a working demo label.
+        """
         monkeypatch.setattr(
             health_module,
             "settings",
             _fake_settings(RAZORPAY_KEY_ID="rzp_test_keyid_123"),
         )
         payments = client.get("/api/config/status").json()["data"]["payments"]
-        assert payments["mode"] == "MOCK"
+        assert payments["mode"] == "UNCONFIGURED"
         assert payments["razorpay_configured"] is False
         assert payments["key_type"] == "test"
+        assert payments["live_key_rejected"] is False
+
+    def test_unrecognised_key_prefix_is_unconfigured(self, client, monkeypatch):
+        """Only a rzp_test_ key pair opens a provider path; anything else is flagged."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(
+                RAZORPAY_KEY_ID="pk_unknown_prefix",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+            ),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "UNCONFIGURED"
+        assert payments["razorpay_configured"] is False
+        assert payments["key_type"] == "unknown"
 
     def test_webhook_missing_is_reported_separately(self, client, monkeypatch):
         """Real keys without a webhook secret: TEST MODE, but settlement is dead."""
@@ -129,8 +150,15 @@ class TestConfigStatusEndpoint:
         assert payments["mode"] == "TEST_MODE"
         assert payments["webhook_configured"] is False
 
-    def test_live_keys_are_labelled(self, client, monkeypatch):
-        """A live key prefix is reported as such so the UI can warn about it."""
+    def test_live_keys_are_rejected_not_reported_as_test_mode(self, client, monkeypatch):
+        """
+        A live key must never be reported as TEST MODE.
+
+        This test previously asserted the opposite: any present key + secret was
+        labelled TEST_MODE, which meant a live-configured deployment advertised
+        itself as a safe test one.  A live key is now refused and reported as
+        LIVE_REJECTED, and no provider can be reached from it.
+        """
         monkeypatch.setattr(
             health_module,
             "settings",
@@ -139,9 +167,45 @@ class TestConfigStatusEndpoint:
                 RAZORPAY_KEY_SECRET="super-secret-value",
             ),
         )
-        payments = client.get("/api/config/status").json()["data"]["payments"]
-        assert payments["mode"] == "TEST_MODE"
+        response = client.get("/api/config/status")
+        payments = response.json()["data"]["payments"]
+
+        assert payments["mode"] == "LIVE_REJECTED"
+        assert payments["mode"] != "TEST_MODE"
+        assert payments["razorpay_configured"] is False
+        assert payments["live_key_rejected"] is True
+        # The prefix class is still reported so an operator can tell why.
         assert payments["key_type"] == "live"
+
+        # The key itself and the secret never leave the server.
+        assert "rzp_live_keyid_123" not in response.text
+        assert "super-secret-value" not in response.text
+
+    def test_live_key_without_secret_is_rejected(self, client, monkeypatch):
+        """Refusal does not depend on the secret being present."""
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(RAZORPAY_KEY_ID="rzp_live_keyid_123"),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "LIVE_REJECTED"
+        assert payments["live_key_rejected"] is True
+
+    def test_validated_settings_with_live_key_report_live_rejected(self, client, monkeypatch):
+        """
+        After validation a live key has been blanked and only the refusal flag
+        remains.  That state must still report LIVE_REJECTED, never MOCK.
+        """
+        monkeypatch.setattr(
+            health_module,
+            "settings",
+            _fake_settings(RAZORPAY_LIVE_KEY_REJECTED=True),
+        )
+        payments = client.get("/api/config/status").json()["data"]["payments"]
+        assert payments["mode"] == "LIVE_REJECTED"
+        assert payments["razorpay_configured"] is False
+        assert payments["live_key_rejected"] is True
 
 
 class TestListCasesEndpoint:

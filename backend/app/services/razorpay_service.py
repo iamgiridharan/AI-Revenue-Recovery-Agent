@@ -7,7 +7,19 @@ This service handles:
 - Payment status retrieval
 
 CRITICAL: This service ONLY uses Razorpay Test Mode.
-NEVER use Razorpay Live Mode in this codebase.
+NEVER use Razorpay Live Mode in this codebase.  A live key is refused at
+configuration time and again here: it can neither initialise a client nor
+create a payment link.
+
+Payment modes and what they allow:
+
+- MOCK (no credentials at all): a clearly labelled local placeholder link.
+- TEST_MODE (complete rzp_test_ key + secret): the Razorpay Test Mode API.  If
+  the SDK is missing or the client cannot be built, execution is refused --
+  a mock link is never returned while the deployment reports TEST_MODE.
+- LIVE_REJECTED (live key supplied): refused, no link of any kind.
+- UNCONFIGURED (partial or unrecognised credentials): refused -- a
+  half-configured deployment must not silently fall back to mock links.
 """
 import hashlib
 import hmac
@@ -15,41 +27,212 @@ import json
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
-from app.core.config import get_settings
+from app.core.config import (
+    LIVE_KEY_PREFIX,
+    PAYMENT_MODE_LIVE_REJECTED,
+    PAYMENT_MODE_MOCK,
+    PAYMENT_MODE_TEST,
+    PAYMENT_MODE_UNCONFIGURED,
+    TEST_KEY_PREFIX,
+    get_settings,
+    key_id_prefix,
+    resolve_payment_mode,
+)
 from app.utils.logging import logger
 
 settings = get_settings()
 
 # Razorpay client instance (initialized lazily)
 _razorpay_client = None
+# Why the last client initialization attempt failed, as a short phrase.  Never the
+# exception text: an SDK error can echo the configuration it was handed.
+_razorpay_client_error: Optional[str] = None
+
+
+class PaymentProviderUnavailableError(RuntimeError):
+    """
+    Base class: the payment provider cannot be used as configured.
+
+    ``code`` is the failure code returned to the caller and ``audit_decision`` the
+    value recorded on the audit event, so a refusal is always recorded with the
+    reason it happened instead of looking like a generic execution failure.
+    """
+
+    code = "PAYMENT_PROVIDER_UNAVAILABLE"
+    audit_decision = "PAYMENT_PROVIDER_UNAVAILABLE"
+
+
+class LiveModeRejectedError(PaymentProviderUnavailableError):
+    """
+    Raised when Razorpay live credentials are configured.
+
+    The project may only reach Test Mode.  This error means a live key was
+    supplied: it has been refused, so no provider client exists and no payment
+    link is created (not even a mock one, which would misrepresent the state).
+    """
+
+    code = "LIVE_MODE_REJECTED"
+    audit_decision = "LIVE_MODE_REJECTED"
+
+
+class PaymentConfigurationError(PaymentProviderUnavailableError):
+    """
+    Raised when Razorpay credentials are partially configured or unrecognised.
+
+    Reaching Test Mode requires a complete ``rzp_test_`` key + secret pair.  A
+    half-configured deployment is refused rather than quietly mocked: mock links
+    from a deployment that looks configured would misrepresent what happened.
+    """
+
+    code = "PAYMENT_UNCONFIGURED"
+    audit_decision = "PAYMENT_UNCONFIGURED"
+
+
+class PaymentProviderInitError(PaymentProviderUnavailableError):
+    """
+    Raised when complete Test Mode credentials are configured but no client exists.
+
+    The SDK may be missing, client construction may fail, or the client may be
+    unavailable for another reason.  Execution is refused: a deployment reporting
+    TEST_MODE must never fall back to a mock link.
+    """
+
+    code = "PAYMENT_PROVIDER_UNAVAILABLE"
+    audit_decision = "PAYMENT_PROVIDER_UNAVAILABLE"
+
+
+def _unconfigured_reason() -> str:
+    """
+    Say what is wrong with the credential set, without echoing any of it.
+
+    Only the shape of the configuration is reported -- which variable is missing,
+    or that the prefix is unsupported.  The key id and secret values never appear.
+    """
+    prefix = key_id_prefix(getattr(settings, "RAZORPAY_KEY_ID", ""))
+    secret = getattr(settings, "RAZORPAY_KEY_SECRET", "")
+    has_secret = isinstance(secret, str) and bool(secret)
+
+    if prefix and not has_secret:
+        return "RAZORPAY_KEY_ID is set but RAZORPAY_KEY_SECRET is missing"
+    if has_secret and not prefix:
+        return "RAZORPAY_KEY_SECRET is set but RAZORPAY_KEY_ID is missing"
+    return (
+        f"RAZORPAY_KEY_ID does not use the supported '{TEST_KEY_PREFIX}' "
+        "Test Mode prefix"
+    )
+
+
+def _unconfigured_message() -> str:
+    """Actionable error text for a half-configured or unrecognised key set."""
+    return (
+        "Payment provider is not configured (mode: UNCONFIGURED): "
+        f"{_unconfigured_reason()}. Set a complete Razorpay Test Mode "
+        f"RAZORPAY_KEY_ID ('{TEST_KEY_PREFIX}...') and RAZORPAY_KEY_SECRET, or "
+        "unset both to run in MOCK mode. No payment link was created and no "
+        "provider call was made."
+    )
+
+
+def _provider_unavailable_message() -> str:
+    """Actionable error text for Test Mode credentials with no usable client."""
+    reason = _razorpay_client_error or "the provider client is unavailable"
+    return (
+        "Payment provider is unavailable (mode: TEST_MODE): complete Razorpay "
+        f"Test Mode credentials are configured but {reason}. Install the Razorpay "
+        "SDK or check the key pair, or unset both RAZORPAY_KEY_ID and "
+        "RAZORPAY_KEY_SECRET to run in MOCK mode. No payment link was created "
+        "and no mock link was substituted."
+    )
+
+
+def _payment_mode() -> str:
+    """Current payment mode, safe against partially-shaped settings doubles."""
+    return resolve_payment_mode(
+        getattr(settings, "RAZORPAY_KEY_ID", ""),
+        getattr(settings, "RAZORPAY_KEY_SECRET", ""),
+        bool(getattr(settings, "RAZORPAY_LIVE_KEY_REJECTED", False)),
+    )
 
 
 def get_razorpay_client():
     """
     Get or initialize the Razorpay client.
-    
+
+    A client is only ever built for a complete ``rzp_test_`` key + secret pair.
+    Live credentials are refused here as well as during settings validation, so
+    no code path can hand the SDK a live key.
+
     Returns:
-        Razorpay client instance or None if not configured
-        
-    Raises:
-        ValueError: If Razorpay credentials are not configured
+        Razorpay client instance or None when no provider may be reached
     """
-    global _razorpay_client
+    global _razorpay_client, _razorpay_client_error
     
     if _razorpay_client is not None:
         return _razorpay_client
-    
-    if not settings.RAZORPAY_KEY_ID or not settings.RAZORPAY_KEY_SECRET:
-        logger.warning("Razorpay credentials not configured. Payment operations will be mocked.")
+
+    mode = _payment_mode()
+
+    if mode == PAYMENT_MODE_LIVE_REJECTED:
+        logger.error(
+            "Refusing to initialize a Razorpay client: live credentials were "
+            "supplied ('%s' key prefix or RAZORPAY_LIVE_KEY_REJECTED is set). "
+            "Only Test Mode keys are accepted; no provider call will be made.",
+            LIVE_KEY_PREFIX,
+        )
+        _razorpay_client = None
+        return None
+
+    # Defense in depth: even a validated mode is re-checked against the prefix
+    # before the SDK is constructed, so this function is safe on its own.
+    if mode != PAYMENT_MODE_TEST or not key_id_prefix(
+        getattr(settings, "RAZORPAY_KEY_ID", "")
+    ).startswith(TEST_KEY_PREFIX):
+        if mode == PAYMENT_MODE_UNCONFIGURED:
+            logger.error(
+                "Refusing to initialize a Razorpay client: credentials are "
+                "partially configured or unrecognised (mode: %s). %s. Payment "
+                "execution will be refused.",
+                mode,
+                _unconfigured_reason(),
+            )
+        else:
+            logger.warning(
+                "No Razorpay credentials configured (mode: %s). Payment links "
+                "will be mocked and no provider call will be made.",
+                mode,
+            )
         return None
     
+    # Recorded so a refusal can say what to fix.  Only a fixed phrase per failure
+    # kind is stored: exception text can echo the configuration it was given.
+    _razorpay_client_error = None
+
     try:
         import razorpay
-        _razorpay_client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
-        logger.info("Razorpay client initialized successfully (Test Mode)")
+    except ImportError:
+        _razorpay_client_error = "the 'razorpay' package is not installed"
+        logger.error(
+            "Cannot initialize a Razorpay client: the 'razorpay' package is not "
+            "installed. Payment execution will be refused."
+        )
+        return None
+
+    try:
+        _razorpay_client = razorpay.Client(
+            auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+        )
+        logger.info(
+            "Razorpay client initialized (Test Mode): only test-mode objects can "
+            "be created, live money cannot move through this client"
+        )
         return _razorpay_client
     except Exception as e:
-        logger.error(f"Failed to initialize Razorpay client: {e}")
+        _razorpay_client_error = "client construction failed"
+        logger.error(
+            "Failed to initialize Razorpay client (%s). Payment execution will be "
+            "refused; no credential values are logged.",
+            type(e).__name__,
+        )
         return None
 
 
@@ -82,12 +265,43 @@ def create_payment_link(
         Dictionary containing payment link details
         
     Raises:
+        LiveModeRejectedError: If live credentials are configured (refused).
+        PaymentConfigurationError: If the credentials are incomplete or use an
+            unsupported prefix (refused -- no mock fallback).
+        PaymentProviderInitError: If Test Mode credentials are configured but no
+            provider client exists (refused -- no mock fallback).
         Exception: If Razorpay API call fails
     """
+    mode = _payment_mode()
+
+    # Live credentials are refused before anything else: no provider call and no
+    # mock link, because a mock link on a live-configured deployment would
+    # misrepresent what happened.
+    if mode == PAYMENT_MODE_LIVE_REJECTED:
+        raise LiveModeRejectedError(
+            "Razorpay live credentials are configured but refused: this "
+            "application runs against Test Mode only. No payment link was created "
+            "and no provider call was made."
+        )
+
+    # Partial or unrecognised credentials are refused as well.  This deployment
+    # was configured for a provider but cannot reach one; silently returning a
+    # mock link would present an unconfigured system as a working one.
+    if mode == PAYMENT_MODE_UNCONFIGURED:
+        raise PaymentConfigurationError(_unconfigured_message())
+
     client = get_razorpay_client()
-    
-    # If no client (not configured), use mock mode
+
     if client is None:
+        # Complete Test Mode credentials are configured, so a provider link is the
+        # only acceptable outcome: a mock link here would report TEST_MODE while
+        # handing back something that can never be paid.
+        if mode == PAYMENT_MODE_TEST:
+            raise PaymentProviderInitError(_provider_unavailable_message())
+
+        # MOCK is the only mode that may produce a placeholder link: no
+        # credentials were supplied at all, so there is no provider state for a
+        # mock link to misrepresent.
         return _create_mock_payment_link(
             amount=amount,
             currency=currency,
@@ -155,8 +369,17 @@ def _create_mock_payment_link(
     """
     Create a mock payment link for testing when Razorpay is not configured.
     
-    This is used for development/testing when Razorpay credentials are not set.
+    This is only reachable in MOCK mode, where no Razorpay credentials are set at
+    all.  A partially configured deployment is refused before this point, and the
+    mode is re-checked here so a mock link can never be produced under TEST_MODE.
     """
+    mode = _payment_mode()
+    if mode != PAYMENT_MODE_MOCK:
+        raise PaymentProviderUnavailableError(
+            f"Refusing to create a mock payment link in {mode} mode: a mock link "
+            "is only valid when no Razorpay credentials are configured."
+        )
+
     import uuid
     
     mock_id = f"plink_{uuid.uuid4().hex[:16]}"
@@ -307,9 +530,33 @@ def get_payment_status(payment_id: str) -> Dict[str, Any]:
     Returns:
         Payment status details
     """
+    mode = _payment_mode()
+
+    if mode == PAYMENT_MODE_LIVE_REJECTED:
+        return {
+            "success": False,
+            "error": ("Payment provider unavailable: Razorpay live credentials "
+                      "are configured but refused (Test Mode only)"),
+            "mock": False,
+        }
+
+    if mode == PAYMENT_MODE_UNCONFIGURED:
+        return {
+            "success": False,
+            "error": _unconfigured_message(),
+            "mock": False,
+        }
+
     client = get_razorpay_client()
-    
+
     if client is None:
+        if mode == PAYMENT_MODE_TEST:
+            return {
+                "success": False,
+                "error": _provider_unavailable_message(),
+                "mock": False,
+            }
+
         return {
             "success": False,
             "error": "Razorpay client not configured",

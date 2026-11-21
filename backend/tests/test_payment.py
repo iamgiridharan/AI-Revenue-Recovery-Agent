@@ -1405,3 +1405,493 @@ class TestCapturedAmountVerification:
         db_session.refresh(risk_case)
         assert risk_case.status == CaseStatus.RECOVERED.value
         assert risk_case.recovered_amount == 2500.0
+
+
+# ============================================================================
+# Environment safety: live Razorpay credentials are refused
+# ============================================================================
+
+
+class TestLiveKeyConfiguration:
+    """A live key is refused at configuration time, so nothing can use it."""
+
+    def test_settings_discards_live_key_and_secret(self):
+        """Validation blanks the live pair and records the refusal."""
+        from app.core.config import Settings
+
+        settings = Settings(
+            RAZORPAY_KEY_ID="rzp_live_keyid_123",
+            RAZORPAY_KEY_SECRET="super-secret-value",
+        )
+
+        assert settings.RAZORPAY_KEY_ID == ""
+        assert settings.RAZORPAY_KEY_SECRET == ""
+        assert settings.RAZORPAY_LIVE_KEY_REJECTED is True
+        assert settings.payment_mode == "LIVE_REJECTED"
+
+    def test_live_prefix_is_rejected_regardless_of_case(self):
+        """A differently-cased live key is still refused."""
+        from app.core.config import Settings
+
+        settings = Settings(
+            RAZORPAY_KEY_ID="RZP_LIVE_KeyId_123",
+            RAZORPAY_KEY_SECRET="super-secret-value",
+        )
+
+        assert settings.RAZORPAY_KEY_ID == ""
+        assert settings.RAZORPAY_KEY_SECRET == ""
+        assert settings.payment_mode == "LIVE_REJECTED"
+
+    def test_test_key_is_accepted(self):
+        """Test Mode keys still configure normally."""
+        from app.core.config import Settings
+
+        settings = Settings(
+            RAZORPAY_KEY_ID="rzp_test_keyid_123",
+            RAZORPAY_KEY_SECRET="super-secret-value",
+        )
+
+        assert settings.RAZORPAY_KEY_ID == "rzp_test_keyid_123"
+        assert settings.payment_mode == "TEST_MODE"
+
+    def test_payment_mode_matrix(self):
+        """Every credential shape maps to exactly one accurate mode."""
+        from app.core.config import resolve_payment_mode
+
+        assert resolve_payment_mode("", "") == "MOCK"
+        assert resolve_payment_mode("", "", True) == "LIVE_REJECTED"
+        assert resolve_payment_mode("rzp_test_keyid_123", "") == "UNCONFIGURED"
+        assert resolve_payment_mode("", "super-secret-value") == "UNCONFIGURED"
+        assert resolve_payment_mode("rzp_test_keyid_123", "secret") == "TEST_MODE"
+        assert resolve_payment_mode("rzp_live_keyid_123", "secret") == "LIVE_REJECTED"
+        assert resolve_payment_mode("rzp_live_keyid_123", "") == "LIVE_REJECTED"
+        assert resolve_payment_mode("pk_other_prefix", "secret") == "UNCONFIGURED"
+
+
+class TestLiveKeyProviderGuard:
+    """No provider client, and therefore no payment link, from a live key."""
+
+    @pytest.fixture
+    def live_settings(self, monkeypatch):
+        """Razorpay settings carrying a live key that never ran validation."""
+        from types import SimpleNamespace
+        import app.services.razorpay_service as razorpay_service
+
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="rzp_live_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+        return razorpay_service
+
+    @pytest.fixture
+    def no_sdk_client(self, monkeypatch):
+        """Make constructing a Razorpay SDK client fail the test."""
+        import sys
+        from types import SimpleNamespace
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError(
+                "razorpay.Client must never be constructed from live credentials"
+            )
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_forbidden))
+
+    def test_client_is_never_created_from_live_credentials(
+        self, live_settings, no_sdk_client
+    ):
+        assert live_settings.get_razorpay_client() is None
+        assert live_settings._razorpay_client is None
+
+    def test_live_credentials_cannot_create_a_payment_link(
+        self, live_settings, no_sdk_client
+    ):
+        from app.services.razorpay_service import LiveModeRejectedError
+
+        with pytest.raises(LiveModeRejectedError):
+            live_settings.create_payment_link(amount=2500.0, reference_id="CASE-LIVE-1")
+
+    def test_live_credentials_refuse_payment_status_lookup(
+        self, live_settings, no_sdk_client
+    ):
+        result = live_settings.get_payment_status("pay_live_123")
+
+        assert result["success"] is False
+        assert result["mock"] is False
+        assert "refused" in result["error"].lower()
+
+    def test_test_mode_still_builds_a_client(self, monkeypatch):
+        """The guard does not break the accepted Test Mode path."""
+        import sys
+        from types import SimpleNamespace
+        import app.services.razorpay_service as razorpay_service
+
+        created = {}
+
+        class _FakeClient:
+            def __init__(self, auth=None):
+                created["auth"] = auth
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_FakeClient))
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="rzp_test_keyid_123",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+
+        client = razorpay_service.get_razorpay_client()
+
+        assert client is not None
+        assert created["auth"] == ("rzp_test_keyid_123", "super-secret-value")
+
+    def test_unknown_prefix_does_not_build_a_client(self, monkeypatch):
+        """A key that is neither test nor live still cannot reach a provider."""
+        import sys
+        from types import SimpleNamespace
+        import app.services.razorpay_service as razorpay_service
+
+        monkeypatch.setitem(
+            sys.modules,
+            "razorpay",
+            SimpleNamespace(Client=lambda *a, **k: pytest.fail("client must not be built")),
+        )
+        monkeypatch.setattr(
+            razorpay_service,
+            "settings",
+            SimpleNamespace(
+                RAZORPAY_KEY_ID="pk_other_prefix",
+                RAZORPAY_KEY_SECRET="super-secret-value",
+                RAZORPAY_WEBHOOK_SECRET="",
+                RAZORPAY_LIVE_KEY_REJECTED=False,
+            ),
+        )
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+
+        assert razorpay_service.get_razorpay_client() is None
+
+
+# ============================================================================
+# Environment safety: partial / unrecognised credentials are refused, not mocked
+# ============================================================================
+
+
+@pytest.fixture
+def configure(monkeypatch):
+    """Point razorpay_service at a credential set and reset its client cache."""
+    from types import SimpleNamespace
+    import app.services.razorpay_service as razorpay_service
+
+    def _configure(**values):
+        fields = {
+            "RAZORPAY_KEY_ID": "",
+            "RAZORPAY_KEY_SECRET": "",
+            "RAZORPAY_WEBHOOK_SECRET": "",
+            "RAZORPAY_LIVE_KEY_REJECTED": False,
+            "CORS_ORIGINS": ["http://localhost:5173"],
+        }
+        fields.update(values)
+        monkeypatch.setattr(razorpay_service, "settings", SimpleNamespace(**fields))
+        monkeypatch.setattr(razorpay_service, "_razorpay_client", None)
+        return razorpay_service
+
+    return _configure
+
+
+@pytest.fixture
+def no_sdk_client(monkeypatch):
+    """Make constructing a Razorpay SDK client fail the test."""
+    import sys
+    from types import SimpleNamespace
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "razorpay.Client must not be constructed for unusable credentials"
+        )
+
+    monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_forbidden))
+
+
+class TestUnconfiguredPaymentBehaviour:
+    """
+    Exactly two credential shapes may create a payment link.
+
+    - no credentials at all (MOCK): a clearly labelled placeholder link;
+    - a complete ``rzp_test_`` pair (TEST_MODE): the Razorpay Test Mode API.
+
+    A half-configured or unrecognised key set (UNCONFIGURED) is refused, so a
+    deployment configured for a provider can never quietly produce mock links that
+    read as recovery activity.
+    """
+
+    # 1. No credentials at all: MOCK execution is allowed and labelled.
+    def test_no_credentials_create_a_labelled_mock_link(self, configure):
+        service = configure()
+
+        result = service.create_payment_link(amount=2500.0, reference_id="CASE-MOCK-1")
+
+        assert result["success"] is True
+        assert result["mock"] is True
+        assert result["provider"] == "mock"
+        assert result["payment_link_id"].startswith("plink_")
+        assert result["payment_link"].startswith("https://mock.invalid/")
+
+    # 2. Complete test credentials: Test Mode execution is allowed.
+    def test_complete_test_credentials_create_a_provider_link(
+        self, configure, monkeypatch
+    ):
+        import sys
+        from types import SimpleNamespace
+
+        created = []
+
+        class _FakePaymentLink:
+            def __init__(self):
+                self.payloads = []
+
+            def create(self, payload):
+                self.payloads.append(payload)
+                return {
+                    "id": "plink_test_1",
+                    "short_url": "https://rzp.io/rzp/plink_test_1",
+                    "status": "created",
+                    "created_at": 1,
+                    "expires_by": 2,
+                }
+
+        class _FakeClient:
+            def __init__(self, auth=None):
+                self.auth = auth
+                self.payment_link = _FakePaymentLink()
+                created.append(self)
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_FakeClient))
+        service = configure(
+            RAZORPAY_KEY_ID="rzp_test_keyid_123",
+            RAZORPAY_KEY_SECRET="super-secret-value",
+        )
+
+        result = service.create_payment_link(amount=2500.0, reference_id="CASE-TEST-1")
+
+        assert result["success"] is True
+        assert result["mock"] is False
+        assert result["provider"] == "razorpay_test_mode"
+        assert result["payment_link"] == "https://rzp.io/rzp/plink_test_1"
+        assert created[0].auth == ("rzp_test_keyid_123", "super-secret-value")
+        assert created[0].payment_link.payloads[0]["amount"] == 250000
+        assert created[0].payment_link.payloads[0]["reference_id"] == "CASE-TEST-1"
+
+    # 4 + 5. Partial credentials and an unknown/malformed prefix are refused.
+    @pytest.mark.parametrize(
+        "key_id,key_secret,expected",
+        [
+            ("rzp_test_keyid_123", "", "RAZORPAY_KEY_SECRET is missing"),
+            ("", "super-secret-value", "RAZORPAY_KEY_ID is missing"),
+            ("pk_other_prefix", "super-secret-value", "rzp_test_"),
+            ("rzp_liveish_keyid", "super-secret-value", "rzp_test_"),
+            ("rzp_test_keyid_123", None, "RAZORPAY_KEY_SECRET is missing"),
+        ],
+    )
+    def test_unusable_credentials_are_refused_without_a_link(
+        self, configure, no_sdk_client, key_id, key_secret, expected
+    ):
+        from app.services.razorpay_service import PaymentConfigurationError
+
+        service = configure(RAZORPAY_KEY_ID=key_id, RAZORPAY_KEY_SECRET=key_secret)
+
+        with pytest.raises(PaymentConfigurationError) as excinfo:
+            service.create_payment_link(amount=2500.0, reference_id="CASE-UNC-1")
+
+        message = str(excinfo.value)
+        assert "mode: UNCONFIGURED" in message
+        assert expected in message
+        # No link of any kind is produced, and no credential value is echoed.
+        assert "mock.invalid" not in message
+        assert "plink_" not in message
+        if key_id:
+            assert key_id not in message
+        if key_secret:
+            assert key_secret not in message
+
+    def test_unconfigured_refusal_carries_its_own_code(
+        self, configure, no_sdk_client
+    ):
+        """The refusal is distinguishable from a generic execution failure."""
+        from app.services.razorpay_service import (
+            PaymentConfigurationError,
+            PaymentProviderUnavailableError,
+        )
+
+        service = configure(RAZORPAY_KEY_ID="rzp_test_keyid_123")
+
+        with pytest.raises(PaymentConfigurationError) as excinfo:
+            service.create_payment_link(amount=100.0)
+
+        assert isinstance(excinfo.value, PaymentProviderUnavailableError)
+        assert excinfo.value.code == "PAYMENT_UNCONFIGURED"
+        assert excinfo.value.audit_decision == "PAYMENT_UNCONFIGURED"
+
+    def test_unconfigured_payment_status_lookup_is_refused(
+        self, configure, no_sdk_client
+    ):
+        service = configure(RAZORPAY_KEY_ID="rzp_test_keyid_123")
+
+        result = service.get_payment_status("pay_123")
+
+        assert result["success"] is False
+        assert result["mock"] is False
+        assert "mode: UNCONFIGURED" in result["error"]
+        assert "RAZORPAY_KEY_SECRET is missing" in result["error"]
+
+
+# ============================================================================
+# Environment safety: TEST_MODE never falls back to a mock link
+# ============================================================================
+
+
+class TestTestModeProviderRefusal:
+    """
+    Complete Test Mode credentials promise a provider link.
+
+    If the SDK is missing or the client cannot be built, execution is refused
+    instead of returning a placeholder: a deployment that reports TEST_MODE must
+    never hand back a link that cannot be paid.  The working-SDK case is covered by
+    ``TestUnconfiguredPaymentBehaviour.test_complete_test_credentials_create_a_provider_link``.
+    """
+
+    @pytest.fixture
+    def test_mode(self, configure):
+        return configure(
+            RAZORPAY_KEY_ID="rzp_test_keyid_123",
+            RAZORPAY_KEY_SECRET="super-secret-value",
+        )
+
+    def test_missing_sdk_refuses_instead_of_mocking(self, test_mode, monkeypatch):
+        import sys
+        from app.services.razorpay_service import (
+            PaymentProviderInitError,
+            PaymentProviderUnavailableError,
+        )
+
+        # ``None`` in sys.modules makes ``import razorpay`` fail deterministically.
+        monkeypatch.setitem(sys.modules, "razorpay", None)
+
+        with pytest.raises(PaymentProviderInitError) as excinfo:
+            test_mode.create_payment_link(amount=2500.0, reference_id="CASE-TM-1")
+
+        assert isinstance(excinfo.value, PaymentProviderUnavailableError)
+        assert excinfo.value.code == "PAYMENT_PROVIDER_UNAVAILABLE"
+        assert excinfo.value.audit_decision == "PAYMENT_PROVIDER_UNAVAILABLE"
+
+        message = str(excinfo.value)
+        assert "mode: TEST_MODE" in message
+        assert "'razorpay' package is not installed" in message
+        assert "No payment link was created" in message
+        # Fake keys are not a real credential, but the value must never travel
+        # through an error message either way.
+        assert "super-secret-value" not in message
+        assert "rzp_test_keyid_123" not in message
+        # No link of any kind.
+        assert "mock.invalid" not in message
+        assert "plink_" not in message
+
+    def test_missing_sdk_never_reaches_the_mock_link_factory(
+        self, test_mode, monkeypatch
+    ):
+        import sys
+
+        monkeypatch.setitem(sys.modules, "razorpay", None)
+        mock_factory = MagicMock()
+        monkeypatch.setattr(test_mode, "_create_mock_payment_link", mock_factory)
+
+        with pytest.raises(test_mode.PaymentProviderInitError):
+            test_mode.create_payment_link(amount=2500.0)
+
+        mock_factory.assert_not_called()
+
+    def test_client_construction_failure_refuses_without_echoing_credentials(
+        self, test_mode, monkeypatch
+    ):
+        import sys
+        from types import SimpleNamespace
+
+        secret = "super-secret-value"
+        seen = []
+
+        class _ExplodingClient:
+            def __init__(self, auth=None):
+                seen.append(auth)
+                raise RuntimeError(f"cannot initialize with {auth}")
+
+        monkeypatch.setitem(
+            sys.modules, "razorpay", SimpleNamespace(Client=_ExplodingClient)
+        )
+
+        with pytest.raises(test_mode.PaymentProviderInitError) as excinfo:
+            test_mode.create_payment_link(amount=2500.0, reference_id="CASE-TM-2")
+
+        message = str(excinfo.value)
+        assert "mode: TEST_MODE" in message
+        assert "client construction failed" in message
+        assert "mock.invalid" not in message
+        # The SDK saw the configured pair, but the error text carries none of it.
+        assert seen == [("rzp_test_keyid_123", secret)]
+        assert secret not in message
+        assert "rzp_test_keyid_123" not in message
+
+    def test_a_failed_initialization_is_not_sticky(self, test_mode, monkeypatch):
+        """Once the SDK is available again, execution uses the provider again."""
+        import sys
+        from types import SimpleNamespace
+
+        monkeypatch.setitem(sys.modules, "razorpay", None)
+        with pytest.raises(test_mode.PaymentProviderInitError):
+            test_mode.create_payment_link(amount=100.0)
+
+        class _FakePaymentLink:
+            def create(self, payload):
+                return {
+                    "id": "plink_test_2",
+                    "short_url": "https://rzp.io/rzp/plink_test_2",
+                    "status": "created",
+                    "created_at": 1,
+                    "expires_by": 2,
+                }
+
+        class _FakeClient:
+            def __init__(self, auth=None):
+                self.auth = auth
+                self.payment_link = _FakePaymentLink()
+
+        monkeypatch.setitem(sys.modules, "razorpay", SimpleNamespace(Client=_FakeClient))
+
+        result = test_mode.create_payment_link(amount=2500.0, reference_id="CASE-TM-3")
+
+        assert result["success"] is True
+        assert result["mock"] is False
+        assert result["provider"] == "razorpay_test_mode"
+        assert result["payment_link"] == "https://rzp.io/rzp/plink_test_2"
+
+    def test_status_lookup_is_refused_when_the_provider_is_unavailable(
+        self, test_mode, monkeypatch
+    ):
+        import sys
+
+        monkeypatch.setitem(sys.modules, "razorpay", None)
+
+        result = test_mode.get_payment_status("pay_123")
+
+        assert result["success"] is False
+        assert result["mock"] is False
+        assert "mode: TEST_MODE" in result["error"]

@@ -16,6 +16,11 @@ services:
         sync: false
       - key: LLM_API_KEY
         sync: false
+      # Required: the mutating routes (diagnose, recovery, review, policy,
+      # simulation) answer 503 while this is unset.  Set the value in the Render
+      # dashboard; never commit a secret here.
+      - key: DEMO_API_KEY
+        sync: false
       - key: DEBUG
         value: "false"
       - key: CORS_ORIGINS
